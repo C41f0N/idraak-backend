@@ -286,6 +286,84 @@ app.post("/issues", authenticateToken, (req, res) => {
   });
 });
 
+// Get recent feed (issues without group_id, limited data for feed)
+app.get("/issues/feed", authenticateToken, async (req, res) => {
+  try {
+    const limit = 20; // Fixed limit for feed
+
+    // Fetch recent issues (not in groups)
+    const issuesQuery = `
+      SELECT 
+        i.issue_id as id, i.title, i.description, i.user_id, 
+        i.display_picture_url, i.upvote_count, i.comment_count, i.posted_at,
+        u.username, u.full_name,
+        'issue' as item_type
+      FROM issues i
+      JOIN users u ON i.user_id = u.user_id
+      WHERE i.group_id IS NULL
+      ORDER BY i.posted_at DESC 
+      LIMIT $1
+    `;
+
+    // Fetch recent groups
+    const groupsQuery = `
+      SELECT 
+        g.group_id as id, g.name as title, g.description, g.owner_id as user_id,
+        g.display_picture_url, g.upvote_count, g.comment_count, g.created_at as posted_at,
+        u.username, u.full_name,
+        'group' as item_type
+      FROM groups g
+      JOIN users u ON g.owner_id = u.user_id
+      ORDER BY g.created_at DESC 
+      LIMIT $1
+    `;
+
+    const [issuesResult, groupsResult] = await Promise.all([
+      pool.query(issuesQuery, [limit]),
+      pool.query(groupsQuery, [limit])
+    ]);
+
+    // Combine and sort by recency
+    const combined = [
+      ...issuesResult.rows.map(row => ({
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        display_picture_url: row.display_picture_url,
+        upvote_count: row.upvote_count,
+        comment_count: row.comment_count,
+        posted_at: row.posted_at,
+        item_type: 'issue'
+      })),
+      ...groupsResult.rows.map(row => ({
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        display_picture_url: row.display_picture_url,
+        upvote_count: row.upvote_count,
+        comment_count: row.comment_count,
+        posted_at: row.posted_at,
+        item_type: 'group'
+      }))
+    ].sort((a, b) => new Date(b.posted_at) - new Date(a.posted_at))
+      .slice(0, limit);
+
+    res.json({
+      items: combined,
+      count: combined.length
+    });
+  } catch (error) {
+    console.error("Error fetching feed:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // Get all issues with pagination
 app.get("/issues", authenticateToken, async (req, res) => {
   try {
@@ -435,7 +513,490 @@ app.post("/issues/:id/upvote", authenticateToken, async (req, res) => {
   }
 });
 
+// Get users who upvoted an issue
+app.get("/issues/:id/upvotes", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT u.user_id, u.username, u.full_name, u.email, iu.made_at
+       FROM issue_upvotes iu
+       JOIN users u ON iu.user_id = u.user_id
+       WHERE iu.issue_id = $1
+       ORDER BY iu.made_at DESC`,
+      [id]
+    );
+
+    res.json({
+      upvotes: result.rows.map(row => ({
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        email: row.email,
+        upvoted_at: row.made_at
+      }))
+    });
+  } catch (error) {
+    console.error("Error fetching upvotes:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ COMMENT ROUTES ============
+
+// Get comments for an issue
+app.get("/issues/:id/comments", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT c.comment_id, c.issue_id, c.user_id, c.content, c.posted_at,
+              u.username, u.full_name
+       FROM comments c
+       JOIN users u ON c.user_id = u.user_id
+       WHERE c.issue_id = $1
+       ORDER BY c.posted_at ASC`,
+      [id]
+    );
+
+    res.json({
+      comments: result.rows.map(row => ({
+        comment_id: row.comment_id,
+        issue_id: row.issue_id,
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        content: row.content,
+        posted_at: row.posted_at
+      }))
+    });
+  } catch (error) {
+    console.error("Error fetching comments:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Add a comment to an issue
+app.post("/issues/:id/comments", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { content } = req.body;
+    const userId = req.user.userId;
+
+    if (!content || content.trim().length === 0) {
+      return res.status(400).json({ error: "Comment content is required" });
+    }
+
+    // Insert comment
+    const result = await pool.query(
+      `INSERT INTO comments (issue_id, user_id, content)
+       VALUES ($1, $2, $3)
+       RETURNING comment_id, issue_id, user_id, content, posted_at`,
+      [id, userId, content.trim()]
+    );
+
+    // Get user info
+    const userResult = await pool.query(
+      `SELECT username, full_name FROM users WHERE user_id = $1`,
+      [userId]
+    );
+
+    // Update comment count on issue
+    await pool.query(
+      `UPDATE issues SET comment_count = comment_count + 1 WHERE issue_id = $1`,
+      [id]
+    );
+
+    const comment = result.rows[0];
+    const user = userResult.rows[0];
+
+    res.status(201).json({
+      comment_id: comment.comment_id,
+      issue_id: comment.issue_id,
+      user_id: comment.user_id,
+      username: user.username,
+      full_name: user.full_name,
+      content: comment.content,
+      posted_at: comment.posted_at
+    });
+  } catch (error) {
+    console.error("Error adding comment:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ GROUP ROUTES ============
+
+// Create a new group with optional display picture
+app.post("/groups", authenticateToken, (req, res) => {
+  uploadIssueFiles(req, res, async (err) => {
+    if (err) {
+      console.error("Upload error:", err);
+      return res.status(400).json({ error: err.message });
+    }
+
+    try {
+      const { name, description } = req.body;
+      const userId = req.user.userId;
+
+      if (!name) {
+        return res.status(400).json({ error: "Name is required" });
+      }
+
+      // Get display picture path if uploaded
+      let displayPictureUrl = null;
+      if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
+        const file = req.files['display_picture'][0];
+        displayPictureUrl = `/uploads/issues/${file.filename}`;
+      }
+
+      // Insert group
+      const result = await pool.query(
+        `INSERT INTO groups (name, description, owner_id, display_picture_url, upvote_count, comment_count)
+         VALUES ($1, $2, $3, $4, 0, 0)
+         RETURNING group_id, name, description, owner_id, display_picture_url, upvote_count, comment_count, created_at`,
+        [name, description || null, userId, displayPictureUrl]
+      );
+
+      const group = result.rows[0];
+
+      res.status(201).json({
+        group_id: group.group_id,
+        name: group.name,
+        description: group.description,
+        owner_id: group.owner_id,
+        display_picture_url: group.display_picture_url,
+        upvote_count: group.upvote_count,
+        comment_count: group.comment_count,
+        created_at: group.created_at
+      });
+    } catch (error) {
+      console.error("Error creating group:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+});
+
+// Get all groups with pagination
+app.get("/groups", authenticateToken, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = parseInt(req.query.offset) || 0;
+
+    const result = await pool.query(
+      `SELECT 
+        g.group_id, g.name, g.description, g.owner_id, g.display_picture_url,
+        g.upvote_count, g.comment_count, g.created_at,
+        u.username, u.full_name,
+        (SELECT COUNT(*) FROM issues WHERE group_id = g.group_id) as issue_count
+       FROM groups g
+       JOIN users u ON g.owner_id = u.user_id
+       ORDER BY g.created_at DESC 
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    res.json({
+      groups: result.rows,
+      limit,
+      offset,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error("Error fetching groups:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get a single group by ID with issues
+app.get("/groups/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get group details
+    const groupResult = await pool.query(
+      `SELECT 
+        g.group_id, g.name, g.description, g.owner_id, g.display_picture_url,
+        g.upvote_count, g.comment_count, g.created_at,
+        u.username, u.full_name
+       FROM groups g
+       JOIN users u ON g.owner_id = u.user_id
+       WHERE g.group_id = $1`,
+      [id]
+    );
+
+    if (groupResult.rows.length === 0) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    const group = groupResult.rows[0];
+
+    // Get issues in this group
+    const issuesResult = await pool.query(
+      `SELECT issue_id, title, description, user_id, display_picture_url, upvote_count, comment_count, posted_at
+       FROM issues
+       WHERE group_id = $1
+       ORDER BY posted_at DESC`,
+      [id]
+    );
+
+    res.json({
+      group_id: group.group_id,
+      name: group.name,
+      description: group.description,
+      owner_id: group.owner_id,
+      username: group.username,
+      full_name: group.full_name,
+      display_picture_url: group.display_picture_url,
+      upvote_count: group.upvote_count,
+      comment_count: group.comment_count,
+      created_at: group.created_at,
+      issues: issuesResult.rows
+    });
+  } catch (error) {
+    console.error("Error fetching group:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Toggle upvote for a group
+app.post("/groups/:id/upvote", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    // Check if user already upvoted
+    const existingUpvote = await pool.query(
+      `SELECT group_upvote_id FROM group_upvotes WHERE group_id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+
+    if (existingUpvote.rows.length > 0) {
+      // Remove upvote
+      await pool.query(
+        `DELETE FROM group_upvotes WHERE group_id = $1 AND user_id = $2`,
+        [id, userId]
+      );
+
+      // Decrement count
+      const result = await pool.query(
+        `UPDATE groups SET upvote_count = upvote_count - 1 
+         WHERE group_id = $1 
+         RETURNING upvote_count`,
+        [id]
+      );
+
+      res.json({ upvoted: false, upvote_count: result.rows[0].upvote_count });
+    } else {
+      // Add upvote
+      await pool.query(
+        `INSERT INTO group_upvotes (group_id, user_id) VALUES ($1, $2)`,
+        [id, userId]
+      );
+
+      // Increment count
+      const result = await pool.query(
+        `UPDATE groups SET upvote_count = upvote_count + 1 
+         WHERE group_id = $1 
+         RETURNING upvote_count`,
+        [id]
+      );
+
+      res.json({ upvoted: true, upvote_count: result.rows[0].upvote_count });
+    }
+  } catch (error) {
+    console.error("Error toggling group upvote:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get users who upvoted a group
+app.get("/groups/:id/upvotes", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT u.user_id, u.username, u.full_name, u.email, gu.made_at
+       FROM group_upvotes gu
+       JOIN users u ON gu.user_id = u.user_id
+       WHERE gu.group_id = $1
+       ORDER BY gu.made_at DESC`,
+      [id]
+    );
+
+    res.json({
+      upvotes: result.rows.map(row => ({
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        email: row.email,
+        upvoted_at: row.made_at
+      }))
+    });
+  } catch (error) {
+    console.error("Error fetching group upvotes:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get comments for a group
+app.get("/groups/:id/comments", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT c.comment_id, c.group_id, c.user_id, c.content, c.posted_at,
+              u.username, u.full_name
+       FROM group_comments c
+       JOIN users u ON c.user_id = u.user_id
+       WHERE c.group_id = $1
+       ORDER BY c.posted_at ASC`,
+      [id]
+    );
+
+    res.json({
+      comments: result.rows.map(row => ({
+        comment_id: row.comment_id,
+        group_id: row.group_id,
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        content: row.content,
+        posted_at: row.posted_at
+      }))
+    });
+  } catch (error) {
+    console.error("Error fetching group comments:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Add a comment to a group
+app.post("/groups/:id/comments", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { content } = req.body;
+    const userId = req.user.userId;
+
+    if (!content || content.trim().length === 0) {
+      return res.status(400).json({ error: "Comment content is required" });
+    }
+
+    // Insert comment
+    const result = await pool.query(
+      `INSERT INTO group_comments (group_id, user_id, content)
+       VALUES ($1, $2, $3)
+       RETURNING comment_id, group_id, user_id, content, posted_at`,
+      [id, userId, content.trim()]
+    );
+
+    // Get user info
+    const userResult = await pool.query(
+      `SELECT username, full_name FROM users WHERE user_id = $1`,
+      [userId]
+    );
+
+    // Update comment count on group
+    await pool.query(
+      `UPDATE groups SET comment_count = comment_count + 1 WHERE group_id = $1`,
+      [id]
+    );
+
+    const comment = result.rows[0];
+    const user = userResult.rows[0];
+
+    res.status(201).json({
+      comment_id: comment.comment_id,
+      group_id: comment.group_id,
+      user_id: comment.user_id,
+      username: user.username,
+      full_name: user.full_name,
+      content: comment.content,
+      posted_at: comment.posted_at
+    });
+  } catch (error) {
+    console.error("Error adding group comment:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ============ USER ROUTES ============
+
+// Get user by ID
+app.get("/users/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const result = await pool.query(
+      `SELECT u.user_id, u.username, u.email, u.full_name, u.role_id, u.created_at,
+              r.title as role_title, r.description as role_description
+       FROM users u
+       LEFT JOIN roles r ON u.role_id = r.role_id
+       WHERE u.user_id = $1`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const user = result.rows[0];
+    res.json({
+      user_id: user.user_id,
+      username: user.username,
+      email: user.email,
+      full_name: user.full_name,
+      role_id: user.role_id,
+      role_title: user.role_title,
+      role_description: user.role_description,
+      created_at: user.created_at
+    });
+  } catch (error) {
+    console.error("Error fetching user:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get multiple users by IDs (batch fetch)
+app.post("/users/batch", authenticateToken, async (req, res) => {
+  try {
+    const { user_ids } = req.body;
+
+    if (!user_ids || !Array.isArray(user_ids) || user_ids.length === 0) {
+      return res.status(400).json({ error: "user_ids array is required" });
+    }
+
+    // Limit batch size to prevent abuse
+    if (user_ids.length > 100) {
+      return res.status(400).json({ error: "Maximum 100 user IDs per request" });
+    }
+
+    const result = await pool.query(
+      `SELECT u.user_id, u.username, u.email, u.full_name, u.role_id, u.created_at,
+              r.title as role_title, r.description as role_description
+       FROM users u
+       LEFT JOIN roles r ON u.role_id = r.role_id
+       WHERE u.user_id = ANY($1)`,
+      [user_ids]
+    );
+
+    const users = result.rows.map(user => ({
+      user_id: user.user_id,
+      username: user.username,
+      email: user.email,
+      full_name: user.full_name,
+      role_id: user.role_id,
+      role_title: user.role_title,
+      role_description: user.role_description,
+      created_at: user.created_at
+    }));
+
+    res.json({ users });
+  } catch (error) {
+    console.error("Error fetching users:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 // Example route: get all users (protected)
 app.get("/users", authenticateToken, async (req, res) => {

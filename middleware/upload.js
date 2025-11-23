@@ -93,12 +93,8 @@ export const uploadIssueFiles = multer({
     }),
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit per file
     fileFilter: (req, file, cb) => {
-        // No filter for display_picture - accept any file type
-        if (file.fieldname === 'display_picture') {
-            cb(null, true);
-        } else {
-            attachmentFilter(req, file, cb);
-        }
+        // No file type restrictions - accept all file types
+        cb(null, true);
     }
 }).fields([
     { name: 'display_picture', maxCount: 1 },
