@@ -24,10 +24,10 @@ export async function comparePassword(password, hash) {
  */
 export function generateToken(userIdOrPayload, email) {
   // If first argument is an object, use it as the full payload
-  const payload = typeof userIdOrPayload === 'object' 
-    ? userIdOrPayload 
+  const payload = typeof userIdOrPayload === 'object'
+    ? userIdOrPayload
     : { userId: userIdOrPayload, email };
-    
+
   return jwt.sign(
     payload,
     JWT_SECRET,
