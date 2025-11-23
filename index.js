@@ -1047,6 +1047,107 @@ app.post("/users", authenticateToken, async (req, res) => {
   }
 });
 
+// ============ SEARCH ROUTE ============
+
+// Search across users, issues, and groups
+app.get("/search", authenticateToken, async (req, res) => {
+  try {
+    const query = req.query.q || '';
+    const type = req.query.type || 'all'; // all, users, issues, groups
+    const limit = parseInt(req.query.limit) || 50;
+
+    if (!query.trim()) {
+      return res.json({
+        users: [],
+        issues: [],
+        groups: [],
+        total: 0
+      });
+    }
+
+    const searchTerm = `%${query}%`;
+    const results = {
+      users: [],
+      issues: [],
+      groups: [],
+      total: 0
+    };
+
+    // Search users
+    if (type === 'all' || type === 'users') {
+      const usersQuery = `
+        SELECT user_id, username, full_name, email
+        FROM users
+        WHERE username ILIKE $1 OR full_name ILIKE $1 OR email ILIKE $1
+        ORDER BY 
+          CASE 
+            WHEN username ILIKE $2 THEN 1
+            WHEN full_name ILIKE $2 THEN 2
+            ELSE 3
+          END,
+          created_at DESC
+        LIMIT $3
+      `;
+      const usersResult = await pool.query(usersQuery, [searchTerm, query, limit]);
+      results.users = usersResult.rows;
+    }
+
+    // Search issues
+    if (type === 'all' || type === 'issues') {
+      const issuesQuery = `
+        SELECT 
+          i.issue_id, i.title, i.description, i.user_id,
+          i.display_picture_url, i.upvote_count, i.comment_count, i.posted_at,
+          u.username, u.full_name
+        FROM issues i
+        JOIN users u ON i.user_id = u.user_id
+        WHERE i.title ILIKE $1 OR i.description ILIKE $1
+        ORDER BY 
+          CASE 
+            WHEN i.title ILIKE $2 THEN 1
+            WHEN i.description ILIKE $2 THEN 2
+            ELSE 3
+          END,
+          i.posted_at DESC
+        LIMIT $3
+      `;
+      const issuesResult = await pool.query(issuesQuery, [searchTerm, query, limit]);
+      results.issues = issuesResult.rows;
+    }
+
+    // Search groups
+    if (type === 'all' || type === 'groups') {
+      const groupsQuery = `
+        SELECT 
+          g.group_id, g.name as title, g.description, g.owner_id as user_id,
+          g.display_picture_url, g.upvote_count, g.comment_count, g.created_at as posted_at,
+          u.username, u.full_name,
+          (SELECT COUNT(*) FROM issues WHERE group_id = g.group_id) as issue_count
+        FROM groups g
+        JOIN users u ON g.owner_id = u.user_id
+        WHERE g.name ILIKE $1 OR g.description ILIKE $1
+        ORDER BY 
+          CASE 
+            WHEN g.name ILIKE $2 THEN 1
+            WHEN g.description ILIKE $2 THEN 2
+            ELSE 3
+          END,
+          g.created_at DESC
+        LIMIT $3
+      `;
+      const groupsResult = await pool.query(groupsQuery, [searchTerm, query, limit]);
+      results.groups = groupsResult.rows;
+    }
+
+    results.total = results.users.length + results.issues.length + results.groups.length;
+
+    res.json(results);
+  } catch (error) {
+    console.error("Error searching:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // Start the server
 app.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
