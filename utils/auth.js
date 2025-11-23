@@ -22,9 +22,14 @@ export async function comparePassword(password, hash) {
 /**
  * Generate a JWT token for a user
  */
-export function generateToken(userId, email) {
+export function generateToken(userIdOrPayload, email) {
+  // If first argument is an object, use it as the full payload
+  const payload = typeof userIdOrPayload === 'object' 
+    ? userIdOrPayload 
+    : { userId: userIdOrPayload, email };
+    
   return jwt.sign(
-    { userId, email },
+    payload,
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES_IN }
   );
