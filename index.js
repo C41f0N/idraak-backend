@@ -292,6 +292,73 @@ app.post("/issues", authenticateToken, (req, res) => {
   });
 });
 
+// Edit an issue
+app.put("/issues/:id", authenticateToken, (req, res) => {
+  uploadIssueFiles(req, res, async (err) => {
+    if (err) {
+      console.error("Upload error:", err);
+      return res.status(400).json({ error: err.message });
+    }
+
+    try {
+      const issueId = req.params.id;
+      const { title, description } = req.body;
+      const userId = req.user.userId;
+
+      if (!title || !description) {
+        return res.status(400).json({ error: "Title and description are required" });
+      }
+
+      // Check if user owns the issue
+      const ownerCheck = await pool.query(
+        "SELECT user_id FROM issues WHERE issue_id = $1",
+        [issueId]
+      );
+
+      if (ownerCheck.rows.length === 0) {
+        return res.status(404).json({ error: "Issue not found" });
+      }
+
+      if (ownerCheck.rows[0].user_id !== userId) {
+        return res.status(403).json({ error: "You can only edit your own issues" });
+      }
+
+      // Get new display picture path if uploaded
+      let displayPictureUrl = undefined;
+      if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
+        const file = req.files['display_picture'][0];
+        displayPictureUrl = `/uploads/issues/${file.filename}`;
+      }
+
+      // Update issue
+      const updateQuery = displayPictureUrl
+        ? `UPDATE issues SET title = $1, description = $2, display_picture_url = $3 WHERE issue_id = $4 
+           RETURNING issue_id, title, description, user_id, group_id, display_picture_url, upvote_count, comment_count, posted_at`
+        : `UPDATE issues SET title = $1, description = $2 WHERE issue_id = $3 
+           RETURNING issue_id, title, description, user_id, group_id, display_picture_url, upvote_count, comment_count, posted_at`;
+
+      const params = displayPictureUrl ? [title, description, displayPictureUrl, issueId] : [title, description, issueId];
+      const issueResult = await pool.query(updateQuery, params);
+      const issue = issueResult.rows[0];
+
+      res.json({
+        issue_id: issue.issue_id,
+        title: issue.title,
+        description: issue.description,
+        user_id: issue.user_id,
+        group_id: issue.group_id,
+        display_picture_url: issue.display_picture_url,
+        upvote_count: issue.upvote_count,
+        comment_count: issue.comment_count,
+        posted_at: issue.posted_at
+      });
+    } catch (error) {
+      console.error("Error updating issue:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+});
+
 // Get recent feed (issues without group_id, limited data for feed)
 app.get("/issues/feed", authenticateToken, async (req, res) => {
   try {
@@ -678,6 +745,72 @@ app.post("/groups", authenticateToken, (req, res) => {
       });
     } catch (error) {
       console.error("Error creating group:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+});
+
+// Edit a group
+app.put("/groups/:id", authenticateToken, (req, res) => {
+  uploadIssueFiles(req, res, async (err) => {
+    if (err) {
+      console.error("Upload error:", err);
+      return res.status(400).json({ error: err.message });
+    }
+
+    try {
+      const groupId = req.params.id;
+      const { name, description } = req.body;
+      const userId = req.user.userId;
+
+      if (!name) {
+        return res.status(400).json({ error: "Name is required" });
+      }
+
+      // Check if user owns the group
+      const ownerCheck = await pool.query(
+        "SELECT owner_id FROM groups WHERE group_id = $1",
+        [groupId]
+      );
+
+      if (ownerCheck.rows.length === 0) {
+        return res.status(404).json({ error: "Group not found" });
+      }
+
+      if (ownerCheck.rows[0].owner_id !== userId) {
+        return res.status(403).json({ error: "You can only edit your own groups" });
+      }
+
+      // Get new display picture path if uploaded
+      let displayPictureUrl = undefined;
+      if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
+        const file = req.files['display_picture'][0];
+        displayPictureUrl = `/uploads/issues/${file.filename}`;
+      }
+
+      // Update group
+      const updateQuery = displayPictureUrl
+        ? `UPDATE groups SET name = $1, description = $2, display_picture_url = $3 WHERE group_id = $4 
+           RETURNING group_id, name, description, owner_id, display_picture_url, upvote_count, comment_count, created_at`
+        : `UPDATE groups SET name = $1, description = $2 WHERE group_id = $3 
+           RETURNING group_id, name, description, owner_id, display_picture_url, upvote_count, comment_count, created_at`;
+
+      const params = displayPictureUrl ? [name, description, displayPictureUrl, groupId] : [name, description, groupId];
+      const result = await pool.query(updateQuery, params);
+      const group = result.rows[0];
+
+      res.json({
+        group_id: group.group_id,
+        name: group.name,
+        description: group.description,
+        owner_id: group.owner_id,
+        display_picture_url: group.display_picture_url,
+        upvote_count: group.upvote_count,
+        comment_count: group.comment_count,
+        created_at: group.created_at
+      });
+    } catch (error) {
+      console.error("Error updating group:", error);
       res.status(500).json({ error: "Internal server error" });
     }
   });
