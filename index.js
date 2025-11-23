@@ -19,6 +19,9 @@ const port = 3000;
 // Parse JSON bodies
 app.use(express.json());
 
+// Serve static files from uploads directory
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 // Create a connection pool to Postgres
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -210,6 +213,224 @@ app.get("/auth/me", authenticateToken, async (req, res) => {
     });
   } catch (err) {
     console.error("Error fetching user:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ ISSUE ROUTES ============
+
+// Create a new issue with optional display picture and attachments
+app.post("/issues", authenticateToken, (req, res) => {
+  uploadIssueFiles(req, res, async (err) => {
+    if (err) {
+      console.error("Upload error:", err);
+      return res.status(400).json({ error: err.message });
+    }
+
+    try {
+      const { title, description, group_id } = req.body;
+      const userId = req.user.userId;
+
+      if (!title || !description) {
+        return res.status(400).json({ error: "Title and description are required" });
+      }
+
+      // Get display picture path if uploaded
+      let displayPictureUrl = null;
+      if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
+        const file = req.files['display_picture'][0];
+        displayPictureUrl = `/uploads/issues/${file.filename}`;
+      }
+
+      // Insert issue
+      const issueResult = await pool.query(
+        `INSERT INTO issues (title, description, user_id, group_id, display_picture_url, upvote_count, comment_count)
+         VALUES ($1, $2, $3, $4, $5, 0, 0)
+         RETURNING issue_id, title, description, user_id, group_id, display_picture_url, upvote_count, comment_count, posted_at`,
+        [title, description, userId, group_id || null, displayPictureUrl]
+      );
+
+      const issue = issueResult.rows[0];
+
+      // Insert attachments if any
+      const attachments = [];
+      if (req.files && req.files['attachments']) {
+        for (const file of req.files['attachments']) {
+          const filePath = `/uploads/attachments/${file.filename}`;
+          const attachmentResult = await pool.query(
+            `INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
+             VALUES ($1, $2, $3)
+             RETURNING attachment_id, file_path, created_at`,
+            [issue.issue_id, userId, filePath]
+          );
+          attachments.push(attachmentResult.rows[0]);
+        }
+      }
+
+      res.status(201).json({
+        issue_id: issue.issue_id,
+        title: issue.title,
+        description: issue.description,
+        user_id: issue.user_id,
+        group_id: issue.group_id,
+        display_picture_url: issue.display_picture_url,
+        upvote_count: issue.upvote_count,
+        comment_count: issue.comment_count,
+        posted_at: issue.posted_at,
+        attachments: attachments
+      });
+    } catch (error) {
+      console.error("Error creating issue:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
+});
+
+// Get all issues with pagination
+app.get("/issues", authenticateToken, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = parseInt(req.query.offset) || 0;
+    const groupId = req.query.group_id;
+
+    let query = `
+      SELECT 
+        i.issue_id, i.title, i.description, i.user_id, i.group_id,
+        i.display_picture_url, i.upvote_count, i.comment_count, i.posted_at,
+        u.username, u.full_name,
+        (SELECT COUNT(*) FROM post_attachments WHERE issue_id = i.issue_id) as attachment_count
+      FROM issues i
+      JOIN users u ON i.user_id = u.user_id
+    `;
+
+    const params = [];
+    if (groupId) {
+      query += ` WHERE i.group_id = $1`;
+      params.push(groupId);
+    }
+
+    query += ` ORDER BY i.posted_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+
+    const result = await pool.query(query, params);
+
+    res.json({
+      issues: result.rows,
+      limit,
+      offset,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error("Error fetching issues:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get a single issue by ID with attachments
+app.get("/issues/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get issue details
+    const issueResult = await pool.query(
+      `SELECT 
+        i.issue_id, i.title, i.description, i.user_id, i.group_id,
+        i.display_picture_url, i.upvote_count, i.comment_count, i.posted_at,
+        u.username, u.full_name
+      FROM issues i
+      JOIN users u ON i.user_id = u.user_id
+      WHERE i.issue_id = $1`,
+      [id]
+    );
+
+    if (issueResult.rows.length === 0) {
+      return res.status(404).json({ error: "Issue not found" });
+    }
+
+    const issue = issueResult.rows[0];
+
+    // Get attachments
+    const attachmentsResult = await pool.query(
+      `SELECT attachment_id, file_path, created_at, uploaded_by
+       FROM post_attachments
+       WHERE issue_id = $1
+       ORDER BY created_at ASC`,
+      [id]
+    );
+
+    // Get comments count (for verification)
+    const commentsResult = await pool.query(
+      `SELECT COUNT(*) as count FROM comments WHERE issue_id = $1`,
+      [id]
+    );
+
+    res.json({
+      issue_id: issue.issue_id,
+      title: issue.title,
+      description: issue.description,
+      user_id: issue.user_id,
+      username: issue.username,
+      full_name: issue.full_name,
+      group_id: issue.group_id,
+      display_picture_url: issue.display_picture_url,
+      upvote_count: issue.upvote_count,
+      comment_count: parseInt(commentsResult.rows[0].count),
+      posted_at: issue.posted_at,
+      attachments: attachmentsResult.rows
+    });
+  } catch (error) {
+    console.error("Error fetching issue:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Update issue upvote count (toggle upvote)
+app.post("/issues/:id/upvote", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    // Check if user already upvoted
+    const existingUpvote = await pool.query(
+      `SELECT upvote_id FROM issue_upvotes WHERE issue_id = $1 AND user_id = $2`,
+      [id, userId]
+    );
+
+    if (existingUpvote.rows.length > 0) {
+      // Remove upvote
+      await pool.query(
+        `DELETE FROM issue_upvotes WHERE issue_id = $1 AND user_id = $2`,
+        [id, userId]
+      );
+
+      // Decrement count
+      const result = await pool.query(
+        `UPDATE issues SET upvote_count = upvote_count - 1 
+         WHERE issue_id = $1 
+         RETURNING upvote_count`,
+        [id]
+      );
+
+      res.json({ upvoted: false, upvote_count: result.rows[0].upvote_count });
+    } else {
+      // Add upvote
+      await pool.query(
+        `INSERT INTO issue_upvotes (issue_id, user_id) VALUES ($1, $2)`,
+        [id, userId]
+      );
+
+      // Increment count
+      const result = await pool.query(
+        `UPDATE issues SET upvote_count = upvote_count + 1 
+         WHERE issue_id = $1 
+         RETURNING upvote_count`,
+        [id]
+      );
+
+      res.json({ upvoted: true, upvote_count: result.rows[0].upvote_count });
+    }
+  } catch (error) {
+    console.error("Error toggling upvote:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
