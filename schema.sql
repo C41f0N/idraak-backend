@@ -9,10 +9,19 @@ CREATE SCHEMA public AUTHORIZATION pg_database_owner;
 
 CREATE TABLE public."admin" (
 	admin_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	email varchar(255) NOT NULL,
+	password_hash text NOT NULL,
 	first_name varchar(50) NOT NULL,
 	last_name varchar(50) NOT NULL,
+	created_at timestamptz DEFAULT now() NOT NULL,
+	CONSTRAINT admin_email_key UNIQUE (email),
 	CONSTRAINT admin_pkey PRIMARY KEY (admin_id)
 );
+
+-- Permissions
+
+ALTER TABLE public."admin" OWNER TO sarim;
+GRANT ALL ON TABLE public."admin" TO sarim;
 
 
 -- public.roles definition
@@ -28,6 +37,11 @@ CREATE TABLE public.roles (
 	upvote_weight int4 DEFAULT 1 NOT NULL,
 	CONSTRAINT roles_pkey PRIMARY KEY (role_id)
 );
+
+-- Permissions
+
+ALTER TABLE public.roles OWNER TO sarim;
+GRANT ALL ON TABLE public.roles TO sarim;
 
 
 -- public.users definition
@@ -50,6 +64,11 @@ CREATE TABLE public.users (
 	CONSTRAINT users_role_id_fkey FOREIGN KEY (role_id) REFERENCES public.roles(role_id)
 );
 
+-- Permissions
+
+ALTER TABLE public.users OWNER TO sarim;
+GRANT ALL ON TABLE public.users TO sarim;
+
 
 -- public."groups" definition
 
@@ -63,9 +82,17 @@ CREATE TABLE public."groups" (
 	description text NULL,
 	owner_id uuid NOT NULL,
 	created_at timestamptz DEFAULT now() NOT NULL,
+	upvote_count int4 DEFAULT 0 NOT NULL,
+	comment_count int4 DEFAULT 0 NOT NULL,
+	display_picture_url text NULL,
 	CONSTRAINT groups_pkey PRIMARY KEY (group_id),
 	CONSTRAINT groups_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
+
+-- Permissions
+
+ALTER TABLE public."groups" OWNER TO sarim;
+GRANT ALL ON TABLE public."groups" TO sarim;
 
 
 -- public.issues definition
@@ -82,10 +109,20 @@ CREATE TABLE public.issues (
 	user_id uuid NOT NULL,
 	group_id uuid NULL,
 	upvote_count int4 DEFAULT 0 NOT NULL,
+	display_picture_url text NULL,
+	comment_count int4 DEFAULT 0 NULL,
 	CONSTRAINT issues_pkey PRIMARY KEY (issue_id),
 	CONSTRAINT issues_group_id_fkey FOREIGN KEY (group_id) REFERENCES public."groups"(group_id) ON DELETE SET NULL,
 	CONSTRAINT issues_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
+CREATE INDEX idx_issues_group_id ON public.issues USING btree (group_id);
+CREATE INDEX idx_issues_posted_at ON public.issues USING btree (posted_at DESC);
+CREATE INDEX idx_issues_user_id ON public.issues USING btree (user_id);
+
+-- Permissions
+
+ALTER TABLE public.issues OWNER TO sarim;
+GRANT ALL ON TABLE public.issues TO sarim;
 
 
 -- public.post_attachments definition
@@ -104,6 +141,11 @@ CREATE TABLE public.post_attachments (
 	CONSTRAINT post_attachments_issue_id_fkey FOREIGN KEY (issue_id) REFERENCES public.issues(issue_id) ON DELETE CASCADE,
 	CONSTRAINT post_attachments_uploaded_by_fkey FOREIGN KEY (uploaded_by) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
+
+-- Permissions
+
+ALTER TABLE public.post_attachments OWNER TO sarim;
+GRANT ALL ON TABLE public.post_attachments TO sarim;
 
 
 -- public.role_change_request definition
@@ -126,6 +168,11 @@ CREATE TABLE public.role_change_request (
 	CONSTRAINT role_change_request_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
 
+-- Permissions
+
+ALTER TABLE public.role_change_request OWNER TO sarim;
+GRANT ALL ON TABLE public.role_change_request TO sarim;
+
 
 -- public."comments" definition
 
@@ -143,6 +190,34 @@ CREATE TABLE public."comments" (
 	CONSTRAINT comments_issue_id_fkey FOREIGN KEY (issue_id) REFERENCES public.issues(issue_id) ON DELETE CASCADE,
 	CONSTRAINT comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
+
+-- Permissions
+
+ALTER TABLE public."comments" OWNER TO sarim;
+GRANT ALL ON TABLE public."comments" TO sarim;
+
+
+-- public.group_comments definition
+
+-- Drop table
+
+-- DROP TABLE public.group_comments;
+
+CREATE TABLE public.group_comments (
+	comment_id uuid DEFAULT gen_random_uuid() NOT NULL,
+	group_id uuid NOT NULL,
+	user_id uuid NOT NULL,
+	"content" text NOT NULL,
+	posted_at timestamptz DEFAULT now() NOT NULL,
+	CONSTRAINT group_comments_pkey PRIMARY KEY (comment_id),
+	CONSTRAINT group_comments_group_id_fkey FOREIGN KEY (group_id) REFERENCES public."groups"(group_id) ON DELETE CASCADE,
+	CONSTRAINT group_comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
+);
+
+-- Permissions
+
+ALTER TABLE public.group_comments OWNER TO sarim;
+GRANT ALL ON TABLE public.group_comments TO sarim;
 
 
 -- public.group_join_request definition
@@ -165,6 +240,11 @@ CREATE TABLE public.group_join_request (
 	CONSTRAINT group_join_request_issue_id_fkey FOREIGN KEY (issue_id) REFERENCES public.issues(issue_id) ON DELETE CASCADE
 );
 
+-- Permissions
+
+ALTER TABLE public.group_join_request OWNER TO sarim;
+GRANT ALL ON TABLE public.group_join_request TO sarim;
+
 
 -- public.group_upvotes definition
 
@@ -183,6 +263,11 @@ CREATE TABLE public.group_upvotes (
 	CONSTRAINT group_upvotes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
 
+-- Permissions
+
+ALTER TABLE public.group_upvotes OWNER TO sarim;
+GRANT ALL ON TABLE public.group_upvotes TO sarim;
+
 
 -- public.issue_upvotes definition
 
@@ -200,6 +285,11 @@ CREATE TABLE public.issue_upvotes (
 	CONSTRAINT issue_upvotes_issue_id_fkey FOREIGN KEY (issue_id) REFERENCES public.issues(issue_id) ON DELETE CASCADE,
 	CONSTRAINT issue_upvotes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
+
+-- Permissions
+
+ALTER TABLE public.issue_upvotes OWNER TO sarim;
+GRANT ALL ON TABLE public.issue_upvotes TO sarim;
 
 
 
@@ -221,6 +311,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.add_comment(uuid, uuid, text) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.add_comment(uuid, uuid, text) TO sarim;
+
 -- DROP FUNCTION public.add_post_attachment(uuid, uuid, text);
 
 CREATE OR REPLACE FUNCTION public.add_post_attachment(p_issue_id uuid, p_uploaded_by uuid, p_file_path text)
@@ -238,6 +333,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.add_post_attachment(uuid, uuid, text) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.add_post_attachment(uuid, uuid, text) TO sarim;
 
 -- DROP FUNCTION public.cancel_group_join_request(uuid, uuid);
 
@@ -289,6 +389,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.cancel_group_join_request(uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.cancel_group_join_request(uuid, uuid) TO sarim;
+
 -- DROP FUNCTION public.create_group(uuid, text, text);
 
 CREATE OR REPLACE FUNCTION public.create_group(p_owner_id uuid, p_name text, p_description text)
@@ -306,6 +411,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.create_group(uuid, text, text) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.create_group(uuid, text, text) TO sarim;
 
 -- DROP FUNCTION public.create_issue(uuid, text, text, uuid);
 
@@ -325,6 +435,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.create_issue(uuid, text, text, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.create_issue(uuid, text, text, uuid) TO sarim;
+
 -- DROP FUNCTION public.create_role(text, text, int4);
 
 CREATE OR REPLACE FUNCTION public.create_role(p_title text, p_description text, p_upvote_weight integer DEFAULT 1)
@@ -342,6 +457,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.create_role(text, text, int4) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.create_role(text, text, int4) TO sarim;
 
 -- DROP FUNCTION public.create_user(uuid, text, text, uuid, text);
 
@@ -361,6 +481,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.create_user(uuid, text, text, uuid, text) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.create_user(uuid, text, text, uuid, text) TO sarim;
+
 -- DROP FUNCTION public.delete_attachment(uuid);
 
 CREATE OR REPLACE FUNCTION public.delete_attachment(p_attachment_id uuid)
@@ -377,6 +502,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.delete_attachment(uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.delete_attachment(uuid) TO sarim;
+
 -- DROP FUNCTION public.get_attachment(uuid);
 
 CREATE OR REPLACE FUNCTION public.get_attachment(p_attachment_id uuid)
@@ -391,6 +521,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.get_attachment(uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.get_attachment(uuid) TO sarim;
 
 -- DROP FUNCTION public.is_username_taken(text);
 
@@ -410,6 +545,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.is_username_taken(text) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.is_username_taken(text) TO sarim;
+
 -- DROP FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid);
 
 CREATE OR REPLACE FUNCTION public.owner_requests_issue_to_add(p_issue_id uuid, p_group_id uuid, p_group_owner_id uuid)
@@ -427,6 +567,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) TO sarim;
 
 -- DROP FUNCTION public.process_group_join_request(uuid, varchar);
 
@@ -460,6 +605,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.process_group_join_request(uuid, varchar) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.process_group_join_request(uuid, varchar) TO sarim;
+
 -- DROP FUNCTION public.process_role_change_request(uuid, text);
 
 CREATE OR REPLACE FUNCTION public.process_role_change_request(p_req_id uuid, p_status text)
@@ -489,6 +639,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.process_role_change_request(uuid, text) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.process_role_change_request(uuid, text) TO sarim;
+
 -- DROP FUNCTION public.remove_group_upvote(uuid, uuid);
 
 CREATE OR REPLACE FUNCTION public.remove_group_upvote(p_group_id uuid, p_user_id uuid)
@@ -502,6 +657,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.remove_group_upvote(uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.remove_group_upvote(uuid, uuid) TO sarim;
 
 -- DROP FUNCTION public.remove_post_upvote(uuid, uuid);
 
@@ -523,6 +683,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.remove_post_upvote(uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.remove_post_upvote(uuid, uuid) TO sarim;
+
 -- DROP FUNCTION public.submit_group_join_request(uuid, uuid, uuid);
 
 CREATE OR REPLACE FUNCTION public.submit_group_join_request(p_issue_id uuid, p_group_id uuid, p_requester_id uuid)
@@ -540,6 +705,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.submit_group_join_request(uuid, uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.submit_group_join_request(uuid, uuid, uuid) TO sarim;
 
 -- DROP FUNCTION public.submit_role_change_request(uuid, uuid, uuid);
 
@@ -559,6 +729,11 @@ END;
 $function$
 ;
 
+-- Permissions
+
+ALTER FUNCTION public.submit_role_change_request(uuid, uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.submit_role_change_request(uuid, uuid, uuid) TO sarim;
+
 -- DROP FUNCTION public.upvote_group(uuid, uuid);
 
 CREATE OR REPLACE FUNCTION public.upvote_group(p_group_id uuid, p_user_id uuid)
@@ -572,6 +747,11 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.upvote_group(uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.upvote_group(uuid, uuid) TO sarim;
 
 -- DROP FUNCTION public.upvote_issue(uuid, uuid);
 
@@ -590,3 +770,14 @@ BEGIN
 END;
 $function$
 ;
+
+-- Permissions
+
+ALTER FUNCTION public.upvote_issue(uuid, uuid) OWNER TO sarim;
+GRANT ALL ON FUNCTION public.upvote_issue(uuid, uuid) TO sarim;
+
+
+-- Permissions
+
+GRANT ALL ON SCHEMA public TO pg_database_owner;
+GRANT USAGE ON SCHEMA public TO public;

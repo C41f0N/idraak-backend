@@ -19,6 +19,12 @@ const port = 3000;
 // Parse JSON bodies
 app.use(express.json());
 
+// Log all incoming requests
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  next();
+});
+
 // Serve static files from uploads directory
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
@@ -1430,6 +1436,539 @@ app.get("/search", authenticateToken, async (req, res) => {
     res.json(results);
   } catch (error) {
     console.error("Error searching:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ ROLES ROUTES ============
+
+// Get all available roles
+app.get("/roles", async (req, res) => {
+  try {
+    console.log('[GET /roles] Fetching roles from database');
+    const result = await pool.query(
+      `SELECT role_id, title, description, upvote_weight 
+       FROM roles 
+       ORDER BY upvote_weight ASC, title ASC`
+    );
+
+    console.log('[GET /roles] Found', result.rows.length, 'roles');
+    const response = { roles: result.rows };
+    console.log('[GET /roles] Sending response:', JSON.stringify(response));
+    res.json(response);
+  } catch (error) {
+    console.error("Error fetching roles:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ ROLE CHANGE REQUEST ROUTES ============
+
+// Submit a role change request
+app.post("/role-change-requests", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { requested_role_id } = req.body;
+
+    if (!requested_role_id) {
+      return res.status(400).json({ error: "requested_role_id is required" });
+    }
+
+    // Check if user already has a pending request
+    const existingRequest = await pool.query(
+      `SELECT req_id FROM role_change_request 
+       WHERE user_id = $1 AND status = 'pending'`,
+      [userId]
+    );
+
+    if (existingRequest.rows.length > 0) {
+      return res.status(400).json({
+        error: "You already have a pending role change request"
+      });
+    }
+
+    // Check if requested role exists
+    const roleCheck = await pool.query(
+      `SELECT role_id FROM roles WHERE role_id = $1`,
+      [requested_role_id]
+    );
+
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Requested role not found" });
+    }
+
+    // Create the request
+    const result = await pool.query(
+      `INSERT INTO role_change_request (user_id, requested_role_id, status)
+       VALUES ($1, $2, 'pending')
+       RETURNING req_id, user_id, requested_role_id, status, submitted_at`,
+      [userId, requested_role_id]
+    );
+
+    res.status(201).json({
+      request: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Error creating role change request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get current user's role change requests
+app.get("/role-change-requests/my", authenticateToken, async (req, res) => {
+  try {
+    console.log('[GET /role-change-requests/my] User ID:', req.user.userId);
+    const userId = req.user.userId;
+
+    const result = await pool.query(
+      `SELECT rcr.req_id, rcr.submitted_at, rcr.reviewed_at, rcr.status,
+              r_current.title as current_role,
+              r_requested.title as requested_role,
+              rcr.requested_role_id
+       FROM role_change_request rcr
+       JOIN users u ON rcr.user_id = u.user_id
+       JOIN roles r_current ON u.role_id = r_current.role_id
+       JOIN roles r_requested ON rcr.requested_role_id = r_requested.role_id
+       WHERE rcr.user_id = $1
+       ORDER BY rcr.submitted_at DESC
+       LIMIT 10`,
+      [userId]
+    );
+
+    res.json({
+      requests: result.rows
+    });
+  } catch (error) {
+    console.error("Error fetching user role requests:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ ADMIN AUTH ROUTES ============
+
+// Admin registration
+app.post("/admin/register", async (req, res) => {
+  const { email, password, first_name, last_name } = req.body;
+
+  if (!email || !password || !first_name || !last_name) {
+    return res.status(400).json({
+      error: "Email, password, first_name, and last_name are required"
+    });
+  }
+
+  // Basic email validation
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return res.status(400).json({ error: "Invalid email format" });
+  }
+
+  // Basic password validation
+  if (password.length < 6) {
+    return res.status(400).json({ error: "Password must be at least 6 characters" });
+  }
+
+  try {
+    // Check if email already exists
+    const existingAdmin = await pool.query(
+      'SELECT admin_id FROM admin WHERE email = $1',
+      [email]
+    );
+
+    if (existingAdmin.rows.length > 0) {
+      return res.status(400).json({
+        error: "Email already exists"
+      });
+    }
+
+    // Hash the password
+    const password_hash = await hashPassword(password);
+
+    // Insert new admin
+    const result = await pool.query(
+      `INSERT INTO admin (email, password_hash, first_name, last_name) 
+       VALUES ($1, $2, $3, $4)
+       RETURNING admin_id, email, first_name, last_name, created_at`,
+      [email, password_hash, first_name, last_name]
+    );
+
+    const admin = result.rows[0];
+
+    // Generate JWT token
+    const token = generateToken({
+      adminId: admin.admin_id,
+      email: admin.email,
+      type: 'admin'
+    });
+
+    res.status(201).json({
+      token,
+      admin: {
+        admin_id: admin.admin_id,
+        email: admin.email,
+        first_name: admin.first_name,
+        last_name: admin.last_name,
+        created_at: admin.created_at
+      }
+    });
+  } catch (err) {
+    console.error("Error registering admin:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Admin login
+app.post("/admin/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({
+      error: "Email and password are required"
+    });
+  }
+
+  try {
+    // Get admin by email
+    const result = await pool.query(
+      `SELECT admin_id, email, first_name, last_name, password_hash, created_at 
+       FROM admin 
+       WHERE email = $1`,
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const admin = result.rows[0];
+
+    // Verify password
+    const isValidPassword = await comparePassword(password, admin.password_hash);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    // Generate JWT token
+    const token = generateToken({
+      adminId: admin.admin_id,
+      email: admin.email,
+      type: 'admin'
+    });
+
+    res.json({
+      token,
+      admin: {
+        admin_id: admin.admin_id,
+        email: admin.email,
+        first_name: admin.first_name,
+        last_name: admin.last_name,
+        created_at: admin.created_at
+      }
+    });
+  } catch (err) {
+    console.error("Error logging in admin:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get current admin info
+app.get("/admin/me", authenticateToken, async (req, res) => {
+  try {
+    // Check if the authenticated user is an admin
+    if (req.user.type !== 'admin') {
+      return res.status(403).json({ error: "Access denied. Admin only." });
+    }
+
+    const adminId = req.user.adminId;
+
+    const result = await pool.query(
+      `SELECT admin_id, email, first_name, last_name, created_at 
+       FROM admin 
+       WHERE admin_id = $1`,
+      [adminId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Admin not found" });
+    }
+
+    res.json({
+      admin: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Error fetching admin info:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ ADMIN MANAGEMENT ENDPOINTS ============
+
+// Middleware to check if user is admin
+const requireAdmin = (req, res, next) => {
+  console.log('requireAdmin middleware - req.user:', req.user);
+  if (!req.user || req.user.type !== 'admin') {
+    return res.status(403).json({ error: "Access denied. Admin only.", user: req.user });
+  }
+  next();
+};
+
+// Get all users with pagination
+app.get("/admin/users", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const search = req.query.search || '';
+
+    const searchCondition = search ?
+      `WHERE username ILIKE $3 OR full_name ILIKE $3 OR email ILIKE $3` : '';
+
+    const params = search ? [limit, offset, `%${search}%`] : [limit, offset];
+
+    const countQuery = `SELECT COUNT(*) FROM users ${searchCondition}`;
+    const countResult = await pool.query(
+      countQuery,
+      search ? [`%${search}%`] : []
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    const usersQuery = `
+      SELECT u.user_id, u.email, u.username, u.full_name, u.created_at,
+             r.title as role_title, r.role_id
+      FROM users u
+      LEFT JOIN roles r ON u.role_id = r.role_id
+      ${searchCondition}
+      ORDER BY u.created_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+
+    const result = await pool.query(usersQuery, params);
+
+    res.json({
+      users: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error("Error fetching users:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all issues with pagination
+app.get("/admin/issues", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const search = req.query.search || '';
+
+    const searchCondition = search ?
+      `WHERE i.title ILIKE $3 OR i.description ILIKE $3` : '';
+
+    const params = search ? [limit, offset, `%${search}%`] : [limit, offset];
+
+    const countQuery = `SELECT COUNT(*) FROM issues i ${searchCondition}`;
+    const countResult = await pool.query(
+      countQuery,
+      search ? [`%${search}%`] : []
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    const issuesQuery = `
+      SELECT i.issue_id, i.title, i.description, i.posted_at,
+             i.upvote_count, i.comment_count, i.display_picture_url,
+             u.username, u.full_name, u.user_id,
+             g.name as group_name, g.group_id
+      FROM issues i
+      JOIN users u ON i.user_id = u.user_id
+      LEFT JOIN groups g ON i.group_id = g.group_id
+      ${searchCondition}
+      ORDER BY i.posted_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+
+    const result = await pool.query(issuesQuery, params);
+
+    res.json({
+      issues: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error("Error fetching issues:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Delete an issue
+app.delete("/admin/issues/:id", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const issueId = req.params.id;
+
+    await pool.query("DELETE FROM issues WHERE issue_id = $1", [issueId]);
+
+    res.json({ message: "Issue deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting issue:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all groups with pagination
+app.get("/admin/groups", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+    const search = req.query.search || '';
+
+    const searchCondition = search ?
+      `WHERE g.name ILIKE $3 OR g.description ILIKE $3` : '';
+
+    const params = search ? [limit, offset, `%${search}%`] : [limit, offset];
+
+    const countQuery = `SELECT COUNT(*) FROM groups g ${searchCondition}`;
+    const countResult = await pool.query(
+      countQuery,
+      search ? [`%${search}%`] : []
+    );
+    const total = parseInt(countResult.rows[0].count);
+
+    const groupsQuery = `
+      SELECT g.group_id, g.name, g.description, g.created_at,
+             g.upvote_count, g.comment_count, g.display_picture_url,
+             u.username, u.full_name, u.user_id as owner_id,
+             (SELECT COUNT(*) FROM issues WHERE group_id = g.group_id) as issue_count
+      FROM groups g
+      JOIN users u ON g.owner_id = u.user_id
+      ${searchCondition}
+      ORDER BY g.created_at DESC
+      LIMIT $1 OFFSET $2
+    `;
+
+    const result = await pool.query(groupsQuery, params);
+
+    res.json({
+      groups: result.rows,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error("Error fetching groups:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Delete a group
+app.delete("/admin/groups/:id", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const groupId = req.params.id;
+
+    await pool.query("DELETE FROM groups WHERE group_id = $1", [groupId]);
+
+    res.json({ message: "Group deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting group:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all role change requests
+app.get("/admin/role-requests", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const status = req.query.status || 'pending';
+
+    const requestsQuery = `
+      SELECT rcr.req_id, rcr.submitted_at, rcr.reviewed_at, rcr.status,
+             u.user_id, u.username, u.full_name, u.email,
+             r_current.title as current_role,
+             r_requested.title as requested_role,
+             r_requested.role_id as requested_role_id
+      FROM role_change_request rcr
+      JOIN users u ON rcr.user_id = u.user_id
+      JOIN roles r_current ON u.role_id = r_current.role_id
+      JOIN roles r_requested ON rcr.requested_role_id = r_requested.role_id
+      WHERE rcr.status = $1
+      ORDER BY rcr.submitted_at DESC
+    `;
+
+    console.log('Executing query:', requestsQuery);
+    console.log('With params:', [status]);
+    const result = await pool.query(requestsQuery, [status]);
+
+    res.json({
+      requests: result.rows
+    });
+  } catch (error) {
+    console.error("Error fetching role requests:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Approve/reject role change request
+app.put("/admin/role-requests/:id", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const requestId = req.params.id;
+    const { status } = req.body; // 'approved' or 'rejected'
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: "Status must be 'approved' or 'rejected'" });
+    }
+
+    // Use the stored procedure
+    await pool.query(
+      "SELECT process_role_change_request($1, $2)",
+      [requestId, status]
+    );
+
+    res.json({ message: `Request ${status}` });
+  } catch (error) {
+    console.error("Error processing role request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get dashboard statistics
+app.get("/admin/stats", authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const stats = await pool.query(`
+      SELECT 
+        (SELECT COUNT(*) FROM users) as total_users,
+        (SELECT COUNT(*) FROM issues) as total_issues,
+        (SELECT COUNT(*) FROM groups) as total_groups,
+        (SELECT COUNT(*) FROM role_change_request WHERE status = 'pending') as pending_role_requests,
+        (SELECT COUNT(*) FROM group_join_request WHERE status = 'pending') as pending_join_requests,
+        (SELECT COUNT(*) FROM comments) as total_comments
+    `);
+
+    const recentActivity = await pool.query(`
+      (SELECT 'issue' as type, issue_id as id, title as name, posted_at as created_at 
+       FROM issues ORDER BY posted_at DESC LIMIT 5)
+      UNION ALL
+      (SELECT 'group' as type, group_id as id, name, created_at 
+       FROM groups ORDER BY created_at DESC LIMIT 5)
+      ORDER BY created_at DESC
+      LIMIT 10
+    `);
+
+    res.json({
+      stats: stats.rows[0],
+      recentActivity: recentActivity.rows
+    });
+  } catch (error) {
+    console.error("Error fetching stats:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
