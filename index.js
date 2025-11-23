@@ -1047,6 +1047,292 @@ app.post("/users", authenticateToken, async (req, res) => {
   }
 });
 
+// ============ GROUP JOIN REQUEST ROUTES ============
+
+// Create a group join request
+app.post("/group-join-requests", authenticateToken, async (req, res) => {
+  try {
+    const { issue_id, group_id, requested_by_group } = req.body;
+    const userId = req.user.userId;
+
+    if (!issue_id || !group_id || typeof requested_by_group !== 'boolean') {
+      return res.status(400).json({
+        error: "issue_id, group_id, and requested_by_group are required"
+      });
+    }
+
+    // Check authorization: either issue owner or group owner
+    if (requested_by_group) {
+      // Group owner is requesting to include an issue
+      const groupCheck = await pool.query(
+        "SELECT owner_id FROM groups WHERE group_id = $1",
+        [group_id]
+      );
+      if (groupCheck.rows.length === 0) {
+        return res.status(404).json({ error: "Group not found" });
+      }
+      if (groupCheck.rows[0].owner_id !== userId) {
+        return res.status(403).json({ error: "Only group owner can make this request" });
+      }
+    } else {
+      // Issue owner is requesting to join a group
+      const issueCheck = await pool.query(
+        "SELECT user_id FROM issues WHERE issue_id = $1",
+        [issue_id]
+      );
+      if (issueCheck.rows.length === 0) {
+        return res.status(404).json({ error: "Issue not found" });
+      }
+      if (issueCheck.rows[0].user_id !== userId) {
+        return res.status(403).json({ error: "Only issue owner can make this request" });
+      }
+    }
+
+    // Check if issue is already in the group
+    const existingLink = await pool.query(
+      "SELECT 1 FROM issues WHERE issue_id = $1 AND group_id = $2",
+      [issue_id, group_id]
+    );
+    if (existingLink.rows.length > 0) {
+      return res.status(400).json({ error: "Issue is already in this group" });
+    }
+
+    // Check if there's already a pending request
+    const existingRequest = await pool.query(
+      `SELECT req_id FROM group_join_request 
+       WHERE issue_id = $1 AND group_id = $2 AND status = 'pending'`,
+      [issue_id, group_id]
+    );
+    if (existingRequest.rows.length > 0) {
+      return res.status(400).json({ error: "A pending request already exists" });
+    }
+
+    // Create the request
+    const result = await pool.query(
+      `INSERT INTO group_join_request (issue_id, group_id, requested_by_group, status, requested_at)
+       VALUES ($1, $2, $3, 'pending', NOW())
+       RETURNING req_id, issue_id, group_id, requested_by_group, status, requested_at, handled_at`,
+      [issue_id, group_id, requested_by_group]
+    );
+
+    res.status(201).json({
+      request: result.rows[0]
+    });
+  } catch (error) {
+    console.error("Error creating group join request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get group join requests
+app.get("/group-join-requests", authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const direction = req.query.direction; // 'incoming' or 'outgoing'
+
+    let query;
+    if (direction === 'incoming') {
+      // Requests where the current user can act
+      query = `
+        SELECT 
+          gjr.req_id, gjr.issue_id, gjr.group_id, gjr.requested_by_group, 
+          gjr.status, gjr.requested_at, gjr.handled_at,
+          i.title as issue_title, i.description as issue_description,
+          i.user_id as issue_owner_id, iu.username as issue_owner_username,
+          g.name as group_name, g.description as group_description,
+          g.owner_id as group_owner_id, gu.username as group_owner_username
+        FROM group_join_request gjr
+        JOIN issues i ON gjr.issue_id = i.issue_id
+        JOIN users iu ON i.user_id = iu.user_id
+        JOIN groups g ON gjr.group_id = g.group_id
+        JOIN users gu ON g.owner_id = gu.user_id
+        WHERE 
+          (gjr.requested_by_group = true AND i.user_id = $1) OR
+          (gjr.requested_by_group = false AND g.owner_id = $1)
+        ORDER BY gjr.requested_at DESC
+      `;
+    } else if (direction === 'outgoing') {
+      // Requests initiated by the current user
+      query = `
+        SELECT 
+          gjr.req_id, gjr.issue_id, gjr.group_id, gjr.requested_by_group, 
+          gjr.status, gjr.requested_at, gjr.handled_at,
+          i.title as issue_title, i.description as issue_description,
+          i.user_id as issue_owner_id, iu.username as issue_owner_username,
+          g.name as group_name, g.description as group_description,
+          g.owner_id as group_owner_id, gu.username as group_owner_username
+        FROM group_join_request gjr
+        JOIN issues i ON gjr.issue_id = i.issue_id
+        JOIN users iu ON i.user_id = iu.user_id
+        JOIN groups g ON gjr.group_id = g.group_id
+        JOIN users gu ON g.owner_id = gu.user_id
+        WHERE 
+          (gjr.requested_by_group = true AND g.owner_id = $1) OR
+          (gjr.requested_by_group = false AND i.user_id = $1)
+        ORDER BY gjr.requested_at DESC
+      `;
+    } else {
+      // All requests involving the user
+      query = `
+        SELECT 
+          gjr.req_id, gjr.issue_id, gjr.group_id, gjr.requested_by_group, 
+          gjr.status, gjr.requested_at, gjr.handled_at,
+          i.title as issue_title, i.description as issue_description,
+          i.user_id as issue_owner_id, iu.username as issue_owner_username,
+          g.name as group_name, g.description as group_description,
+          g.owner_id as group_owner_id, gu.username as group_owner_username
+        FROM group_join_request gjr
+        JOIN issues i ON gjr.issue_id = i.issue_id
+        JOIN users iu ON i.user_id = iu.user_id
+        JOIN groups g ON gjr.group_id = g.group_id
+        JOIN users gu ON g.owner_id = gu.user_id
+        WHERE i.user_id = $1 OR g.owner_id = $1
+        ORDER BY gjr.requested_at DESC
+      `;
+    }
+
+    const result = await pool.query(query, [userId]);
+
+    res.json({
+      requests: result.rows
+    });
+  } catch (error) {
+    console.error("Error fetching group join requests:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Accept or decline a group join request
+app.put("/group-join-requests/:id", authenticateToken, async (req, res) => {
+  try {
+    const requestId = req.params.id;
+    const { status } = req.body;
+    const userId = req.user.userId;
+
+    if (!status || !['accepted', 'declined'].includes(status)) {
+      return res.status(400).json({ error: "Status must be 'accepted' or 'declined'" });
+    }
+
+    // Get the request details
+    const requestQuery = await pool.query(
+      `SELECT gjr.*, i.user_id as issue_owner_id, g.owner_id as group_owner_id
+       FROM group_join_request gjr
+       JOIN issues i ON gjr.issue_id = i.issue_id
+       JOIN groups g ON gjr.group_id = g.group_id
+       WHERE gjr.req_id = $1`,
+      [requestId]
+    );
+
+    if (requestQuery.rows.length === 0) {
+      return res.status(404).json({ error: "Request not found" });
+    }
+
+    const request = requestQuery.rows[0];
+
+    // Check if request is still pending
+    if (request.status !== 'pending') {
+      return res.status(400).json({ error: "Request is not pending" });
+    }
+
+    // Check authorization
+    let canAct = false;
+    if (request.requested_by_group) {
+      // Group requested to include issue; issue owner can act
+      canAct = request.issue_owner_id === userId;
+    } else {
+      // Issue requested to join group; group owner can act
+      canAct = request.group_owner_id === userId;
+    }
+
+    if (!canAct) {
+      return res.status(403).json({ error: "Not authorized to act on this request" });
+    }
+
+    // Update the request
+    await pool.query(
+      `UPDATE group_join_request 
+       SET status = $1, handled_at = NOW()
+       WHERE req_id = $2`,
+      [status, requestId]
+    );
+
+    // If accepted, add issue to group
+    if (status === 'accepted') {
+      await pool.query(
+        `UPDATE issues SET group_id = $1 WHERE issue_id = $2`,
+        [request.group_id, request.issue_id]
+      );
+    }
+
+    res.json({
+      message: `Request ${status}`,
+      request_id: requestId
+    });
+  } catch (error) {
+    console.error("Error processing group join request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Cancel a group join request
+app.delete("/group-join-requests/:id", authenticateToken, async (req, res) => {
+  try {
+    const requestId = req.params.id;
+    const userId = req.user.userId;
+
+    // Get the request details
+    const requestQuery = await pool.query(
+      `SELECT gjr.*, i.user_id as issue_owner_id, g.owner_id as group_owner_id
+       FROM group_join_request gjr
+       JOIN issues i ON gjr.issue_id = i.issue_id
+       JOIN groups g ON gjr.group_id = g.group_id
+       WHERE gjr.req_id = $1`,
+      [requestId]
+    );
+
+    if (requestQuery.rows.length === 0) {
+      return res.status(404).json({ error: "Request not found" });
+    }
+
+    const request = requestQuery.rows[0];
+
+    // Check if request is still pending
+    if (request.status !== 'pending') {
+      return res.status(400).json({ error: "Request is not pending" });
+    }
+
+    // Check authorization - requester can cancel
+    let canCancel = false;
+    if (request.requested_by_group) {
+      // Group owner can cancel their outgoing request
+      canCancel = request.group_owner_id === userId;
+    } else {
+      // Issue owner can cancel their outgoing request
+      canCancel = request.issue_owner_id === userId;
+    }
+
+    if (!canCancel) {
+      return res.status(403).json({ error: "Not authorized to cancel this request" });
+    }
+
+    // Update the request to cancelled
+    await pool.query(
+      `UPDATE group_join_request 
+       SET status = 'cancelled', handled_at = NOW()
+       WHERE req_id = $1`,
+      [requestId]
+    );
+
+    res.json({
+      message: "Request cancelled",
+      request_id: requestId
+    });
+  } catch (error) {
+    console.error("Error cancelling group join request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ============ SEARCH ROUTE ============
 
 // Search across users, issues, and groups
