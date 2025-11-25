@@ -2,7 +2,6 @@ import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 
 const SALT_ROUNDS = 10;
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this';
 const JWT_EXPIRES_IN = '7d'; // 7 days
 
 /**
@@ -28,9 +27,11 @@ export function generateToken(userIdOrPayload, email) {
     ? userIdOrPayload
     : { userId: userIdOrPayload, email };
 
+  const secret = process.env.JWT_SECRET || 'your-secret-key-change-this';
+
   return jwt.sign(
     payload,
-    JWT_SECRET,
+    secret,
     { expiresIn: JWT_EXPIRES_IN }
   );
 }
@@ -39,8 +40,9 @@ export function generateToken(userIdOrPayload, email) {
  * Verify a JWT token
  */
 export function verifyToken(token) {
+  const secret = process.env.JWT_SECRET || 'your-secret-key-change-this';
   try {
-    return jwt.verify(token, JWT_SECRET);
+    return jwt.verify(token, secret);
   } catch (err) {
     return null;
   }

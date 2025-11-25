@@ -7,7 +7,6 @@ import { hashPassword, comparePassword, generateToken } from "./utils/auth.js";
 import { authenticateToken } from "./middleware/auth.js";
 import { authenticateAdmin } from "./middleware/adminAuth.js";
 import { uploadIssueFiles } from "./middleware/upload.js";
-import { uploadToSupabase, removeFromSupabase } from "./utils/supabase.js";
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -505,7 +504,284 @@ app.get("/role-change-requests", authenticateToken, async (req, res) => {
   }
 });
 
+// ============ ADMIN ROUTES ============
+
+// Admin login
+app.post("/admin/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT admin_id, email, first_name, last_name, password_hash FROM admin WHERE email = $1',
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    const admin = result.rows[0];
+    const isValid = await comparePassword(password, admin.password_hash);
+
+    if (!isValid) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    // Generate JWT token with adminId
+    const token = generateToken({ adminId: admin.admin_id, email: admin.email });
+
+    res.json({
+      token,
+      admin: {
+        id: admin.admin_id,
+        email: admin.email,
+        firstName: admin.first_name,
+        lastName: admin.last_name
+      }
+    });
+  } catch (err) {
+    console.error("Error logging in admin:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Create a new role (admin only)
+app.post("/admin/roles", authenticateAdmin, async (req, res) => {
+  const { title, description, upvote_weight } = req.body;
+
+  if (!title || upvote_weight === undefined) {
+    return res.status(400).json({ error: "Title and upvote_weight are required" });
+  }
+
+  if (upvote_weight < 1 || !Number.isInteger(upvote_weight)) {
+    return res.status(400).json({ error: "Upvote weight must be a positive integer" });
+  }
+
+  try {
+    // Check if role title already exists
+    const existing = await pool.query(
+      'SELECT role_id FROM roles WHERE title = $1',
+      [title]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: "Role with this title already exists" });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO roles (title, description, upvote_weight) VALUES ($1, $2, $3) RETURNING role_id, title, description, upvote_weight',
+      [title, description || null, upvote_weight]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Error creating role:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all roles (admin only)
+app.get("/admin/roles", authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT role_id, title, description, upvote_weight FROM roles ORDER BY upvote_weight ASC'
+    );
+
+    res.json({ roles: result.rows });
+  } catch (err) {
+    console.error("Error fetching roles:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Update a role (admin only)
+app.put("/admin/roles/:id", authenticateAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { title, description, upvote_weight } = req.body;
+
+  if (!title && !description && upvote_weight === undefined) {
+    return res.status(400).json({ error: "At least one field to update is required" });
+  }
+
+  if (upvote_weight !== undefined && (upvote_weight < 1 || !Number.isInteger(upvote_weight))) {
+    return res.status(400).json({ error: "Upvote weight must be a positive integer" });
+  }
+
+  try {
+    // Build dynamic update query
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (title) {
+      updates.push(`title = $${paramCount++}`);
+      values.push(title);
+    }
+    if (description !== undefined) {
+      updates.push(`description = $${paramCount++}`);
+      values.push(description);
+    }
+    if (upvote_weight !== undefined) {
+      updates.push(`upvote_weight = $${paramCount++}`);
+      values.push(upvote_weight);
+    }
+
+    values.push(id);
+
+    const result = await pool.query(
+      `UPDATE roles SET ${updates.join(', ')} WHERE role_id = $${paramCount} RETURNING role_id, title, description, upvote_weight`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Error updating role:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Delete a role (admin only)
+app.delete("/admin/roles/:id", authenticateAdmin, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Check if role exists
+    const roleCheck = await pool.query(
+      'SELECT title FROM roles WHERE role_id = $1',
+      [id]
+    );
+
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+
+    // Prevent deletion of Citizen role
+    if (roleCheck.rows[0].title === 'Citizen') {
+      return res.status(400).json({ error: "Cannot delete the default Citizen role" });
+    }
+
+    // Check if role is assigned to any users
+    const usersWithRole = await pool.query(
+      'SELECT COUNT(*) as count FROM users WHERE role_id = $1',
+      [id]
+    );
+
+    if (parseInt(usersWithRole.rows[0].count) > 0) {
+      return res.status(400).json({
+        error: "Cannot delete role that is assigned to users",
+        users_count: parseInt(usersWithRole.rows[0].count)
+      });
+    }
+
+    await pool.query('DELETE FROM roles WHERE role_id = $1', [id]);
+
+    res.json({ message: "Role deleted successfully" });
+  } catch (err) {
+    console.error("Error deleting role:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ USER ROLE ROUTES ============
+
+// Get all available roles (for users to see what they can request)
+app.get("/roles", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT role_id, title, description, upvote_weight FROM roles ORDER BY upvote_weight ASC'
+    );
+
+    res.json({ roles: result.rows });
+  } catch (err) {
+    console.error("Error fetching roles:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Submit a role change request
+app.post("/role-change-request", authenticateToken, async (req, res) => {
+  const { requested_role_id } = req.body;
+  const userId = req.user.userId;
+
+  if (!requested_role_id) {
+    return res.status(400).json({ error: "requested_role_id is required" });
+  }
+
+  try {
+    // Check if role exists
+    const roleCheck = await pool.query(
+      'SELECT role_id FROM roles WHERE role_id = $1',
+      [requested_role_id]
+    );
+
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+
+    // Check if user already has this role
+    const userRole = await pool.query(
+      'SELECT role_id FROM users WHERE user_id = $1',
+      [userId]
+    );
+
+    if (userRole.rows[0].role_id === requested_role_id) {
+      return res.status(400).json({ error: "You already have this role" });
+    }
+
+    // Check if there's already a pending request
+    const existingRequest = await pool.query(
+      'SELECT req_id FROM role_change_request WHERE user_id = $1 AND requested_role_id = $2 AND status = $3',
+      [userId, requested_role_id, 'pending']
+    );
+
+    if (existingRequest.rows.length > 0) {
+      return res.status(400).json({ error: "You already have a pending request for this role" });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO role_change_request (user_id, requested_role_id) VALUES ($1, $2) RETURNING req_id, user_id, requested_role_id, status, submitted_at',
+      [userId, requested_role_id]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Error submitting role change request:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get user's role change requests
+app.get("/role-change-requests", authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+
+  try {
+    const result = await pool.query(
+      `SELECT rcr.req_id, rcr.user_id, rcr.requested_role_id, rcr.status, rcr.submitted_at, rcr.reviewed_at,
+              r.title as role_title, r.description as role_description, r.upvote_weight
+       FROM role_change_request rcr
+       JOIN roles r ON rcr.requested_role_id = r.role_id
+       WHERE rcr.user_id = $1
+       ORDER BY rcr.submitted_at DESC`,
+      [userId]
+    );
+
+    res.json({ requests: result.rows });
+  } catch (err) {
+    console.error("Error fetching role change requests:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ============ ISSUE ROUTES ============
+
 
 
 // Create a new issue with optional display picture and attachments
