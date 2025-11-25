@@ -5,7 +5,10 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { hashPassword, comparePassword, generateToken } from "./utils/auth.js";
 import { authenticateToken } from "./middleware/auth.js";
+import { authenticateAdmin } from "./middleware/adminAuth.js";
 import { uploadIssueFiles } from "./middleware/upload.js";
+import { uploadToSupabase, removeFromSupabase } from "./utils/supabase.js";
+
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -223,7 +226,287 @@ app.get("/auth/me", authenticateToken, async (req, res) => {
   }
 });
 
+// ============ ADMIN ROUTES ============
+
+// Admin login
+app.post("/admin/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT admin_id, email, first_name, last_name, password_hash FROM admin WHERE email = $1',
+      [email]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    const admin = result.rows[0];
+    const isValid = await comparePassword(password, admin.password_hash);
+
+    if (!isValid) {
+      return res.status(401).json({ error: "Invalid email or password" });
+    }
+
+    // Generate JWT token with adminId
+    const token = generateToken({
+      adminId: admin.admin_id,
+      email: admin.email
+    });
+
+    res.json({
+      token,
+      admin: {
+        id: admin.admin_id,
+        email: admin.email,
+        firstName: admin.first_name,
+        lastName: admin.last_name
+      }
+    });
+  } catch (err) {
+    console.error("Error logging in admin:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Create a new role (admin only)
+app.post("/admin/roles", authenticateAdmin, async (req, res) => {
+  const { title, description, upvote_weight } = req.body;
+
+  if (!title || upvote_weight === undefined) {
+    return res.status(400).json({ error: "Title and upvote_weight are required" });
+  }
+
+  if (upvote_weight < 1 || !Number.isInteger(upvote_weight)) {
+    return res.status(400).json({ error: "Upvote weight must be a positive integer" });
+  }
+
+  try {
+    // Check if role title already exists
+    const existing = await pool.query(
+      'SELECT role_id FROM roles WHERE title = $1',
+      [title]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: "Role with this title already exists" });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO roles (title, description, upvote_weight) VALUES ($1, $2, $3) RETURNING role_id, title, description, upvote_weight',
+      [title, description || null, upvote_weight]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Error creating role:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get all roles (admin only)
+app.get("/admin/roles", authenticateAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT role_id, title, description, upvote_weight FROM roles ORDER BY upvote_weight ASC'
+    );
+
+    res.json({ roles: result.rows });
+  } catch (err) {
+    console.error("Error fetching roles:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Update a role (admin only)
+app.put("/admin/roles/:id", authenticateAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { title, description, upvote_weight } = req.body;
+
+  if (!title && !description && upvote_weight === undefined) {
+    return res.status(400).json({ error: "At least one field to update is required" });
+  }
+
+  if (upvote_weight !== undefined && (upvote_weight < 1 || !Number.isInteger(upvote_weight))) {
+    return res.status(400).json({ error: "Upvote weight must be a positive integer" });
+  }
+
+  try {
+    // Build dynamic update query
+    const updates = [];
+    const values = [];
+    let paramCount = 1;
+
+    if (title) {
+      updates.push(`title = $${paramCount++}`);
+      values.push(title);
+    }
+    if (description !== undefined) {
+      updates.push(`description = $${paramCount++}`);
+      values.push(description);
+    }
+    if (upvote_weight !== undefined) {
+      updates.push(`upvote_weight = $${paramCount++}`);
+      values.push(upvote_weight);
+    }
+
+    values.push(id);
+
+    const result = await pool.query(
+      `UPDATE roles SET ${updates.join(', ')} WHERE role_id = $${paramCount} RETURNING role_id, title, description, upvote_weight`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("Error updating role:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Delete a role (admin only)
+app.delete("/admin/roles/:id", authenticateAdmin, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Check if role exists
+    const roleCheck = await pool.query(
+      'SELECT title FROM roles WHERE role_id = $1',
+      [id]
+    );
+
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+
+    // Prevent deletion of Citizen role
+    if (roleCheck.rows[0].title === 'Citizen') {
+      return res.status(400).json({ error: "Cannot delete the default Citizen role" });
+    }
+
+    // Check if role is assigned to any users
+    const usersWithRole = await pool.query(
+      'SELECT COUNT(*) as count FROM users WHERE role_id = $1',
+      [id]
+    );
+
+    if (parseInt(usersWithRole.rows[0].count) > 0) {
+      return res.status(400).json({
+        error: "Cannot delete role that is assigned to users",
+        users_count: parseInt(usersWithRole.rows[0].count)
+      });
+    }
+
+    await pool.query('DELETE FROM roles WHERE role_id = $1', [id]);
+
+    res.json({ message: "Role deleted successfully" });
+  } catch (err) {
+    console.error("Error deleting role:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ============ USER ROLE ROUTES ============
+
+// Get all available roles (for users to see what they can request)
+app.get("/roles", authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT role_id, title, description, upvote_weight FROM roles ORDER BY upvote_weight ASC'
+    );
+
+    res.json({ roles: result.rows });
+  } catch (err) {
+    console.error("Error fetching roles:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Submit a role change request
+app.post("/role-change-request", authenticateToken, async (req, res) => {
+  const { requested_role_id } = req.body;
+  const userId = req.user.userId;
+
+  if (!requested_role_id) {
+    return res.status(400).json({ error: "requested_role_id is required" });
+  }
+
+  try {
+    // Check if role exists
+    const roleCheck = await pool.query(
+      'SELECT role_id FROM roles WHERE role_id = $1',
+      [requested_role_id]
+    );
+
+    if (roleCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Role not found" });
+    }
+
+    // Check if user already has this role
+    const userRole = await pool.query(
+      'SELECT role_id FROM users WHERE user_id = $1',
+      [userId]
+    );
+
+    if (userRole.rows[0].role_id === requested_role_id) {
+      return res.status(400).json({ error: "You already have this role" });
+    }
+
+    // Check if there's already a pending request
+    const existingRequest = await pool.query(
+      'SELECT req_id FROM role_change_request WHERE user_id = $1 AND requested_role_id = $2 AND status = $3',
+      [userId, requested_role_id, 'pending']
+    );
+
+    if (existingRequest.rows.length > 0) {
+      return res.status(400).json({ error: "You already have a pending request for this role" });
+    }
+
+    const result = await pool.query(
+      'INSERT INTO role_change_request (user_id, requested_role_id) VALUES ($1, $2) RETURNING req_id, user_id, requested_role_id, status, submitted_at',
+      [userId, requested_role_id]
+    );
+
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error("Error submitting role change request:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Get user's role change requests
+app.get("/role-change-requests", authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+
+  try {
+    const result = await pool.query(
+      `SELECT rcr.req_id, rcr.user_id, rcr.requested_role_id, rcr.status, rcr.submitted_at, rcr.reviewed_at,
+              r.title as role_title, r.description as role_description, r.upvote_weight
+       FROM role_change_request rcr
+       JOIN roles r ON rcr.requested_role_id = r.role_id
+       WHERE rcr.user_id = $1
+       ORDER BY rcr.submitted_at DESC`,
+      [userId]
+    );
+
+    res.json({ requests: result.rows });
+  } catch (err) {
+    console.error("Error fetching role change requests:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ============ ISSUE ROUTES ============
+
 
 // Create a new issue with optional display picture and attachments
 app.post("/issues", authenticateToken, (req, res) => {
@@ -233,6 +516,25 @@ app.post("/issues", authenticateToken, (req, res) => {
       return res.status(400).json({ error: err.message });
     }
 
+    const uploadedFiles = new Map();
+    const trackUpload = (bucket, storagePath) => {
+      if (!storagePath) return;
+      if (!uploadedFiles.has(bucket)) {
+        uploadedFiles.set(bucket, new Set());
+      }
+      uploadedFiles.get(bucket).add(storagePath);
+    };
+
+    const cleanupUploads = async () => {
+      await Promise.all(
+        Array.from(uploadedFiles.entries()).map(([bucket, paths]) =>
+          removeFromSupabase(bucket, Array.from(paths))
+        )
+      );
+    };
+
+    let issue = null;
+
     try {
       const { title, description, group_id } = req.body;
       const userId = req.user.userId;
@@ -241,36 +543,55 @@ app.post("/issues", authenticateToken, (req, res) => {
         return res.status(400).json({ error: "Title and description are required" });
       }
 
-      // Get display picture path if uploaded
-      let displayPictureUrl = null;
-      if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
-        const file = req.files['display_picture'][0];
-        displayPictureUrl = `/uploads/issues/${file.filename}`;
-      }
-
-      // Insert issue
       const issueResult = await pool.query(
         `INSERT INTO issues (title, description, user_id, group_id, display_picture_url, upvote_count, comment_count)
          VALUES ($1, $2, $3, $4, $5, 0, 0)
          RETURNING issue_id, title, description, user_id, group_id, display_picture_url, upvote_count, comment_count, posted_at`,
-        [title, description, userId, group_id || null, displayPictureUrl]
+        [title, description, userId, group_id || null, null]
       );
 
-      const issue = issueResult.rows[0];
+      issue = issueResult.rows[0];
 
-      // Insert attachments if any
+      let displayPictureUrl = null;
+      const displayPictures = req.files?.['display_picture'];
+      if (displayPictures && displayPictures[0]) {
+        const file = displayPictures[0];
+        const { storagePath, publicUrl } = await uploadToSupabase({
+          bucket: 'issues',
+          buffer: file.buffer,
+          originalName: file.originalname,
+          contentType: file.mimetype,
+          pathSegments: ['issues', issue.issue_id, 'display-picture']
+        });
+        trackUpload('issues', storagePath);
+        displayPictureUrl = publicUrl;
+
+        await pool.query(
+          `UPDATE issues SET display_picture_url = $1 WHERE issue_id = $2`,
+          [displayPictureUrl, issue.issue_id]
+        );
+        issue.display_picture_url = displayPictureUrl;
+      }
+
       const attachments = [];
-      if (req.files && req.files['attachments']) {
-        for (const file of req.files['attachments']) {
-          const filePath = `/uploads/attachments/${file.filename}`;
-          const attachmentResult = await pool.query(
-            `INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
-             VALUES ($1, $2, $3)
-             RETURNING attachment_id, file_path, created_at`,
-            [issue.issue_id, userId, filePath]
-          );
-          attachments.push(attachmentResult.rows[0]);
-        }
+      const attachmentFiles = req.files?.['attachments'] || [];
+      for (const file of attachmentFiles) {
+        const { storagePath, publicUrl } = await uploadToSupabase({
+          bucket: 'attachments',
+          buffer: file.buffer,
+          originalName: file.originalname,
+          contentType: file.mimetype,
+          pathSegments: [issue.issue_id]
+        });
+        trackUpload('attachments', storagePath);
+
+        const attachmentResult = await pool.query(
+          `INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
+           VALUES ($1, $2, $3)
+           RETURNING attachment_id, file_path, created_at`,
+          [issue.issue_id, userId, publicUrl]
+        );
+        attachments.push(attachmentResult.rows[0]);
       }
 
       res.status(201).json({
@@ -283,10 +604,19 @@ app.post("/issues", authenticateToken, (req, res) => {
         upvote_count: issue.upvote_count,
         comment_count: issue.comment_count,
         posted_at: issue.posted_at,
-        attachments: attachments
+        attachments
       });
     } catch (error) {
       console.error("Error creating issue:", error);
+      await cleanupUploads().catch(() => { });
+
+      if (issue?.issue_id) {
+        await pool.query(`DELETE FROM post_attachments WHERE issue_id = $1`, [issue.issue_id]).catch(
+          () => { }
+        );
+        await pool.query(`DELETE FROM issues WHERE issue_id = $1`, [issue.issue_id]).catch(() => { });
+      }
+
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -341,6 +671,21 @@ app.put("/issues/:id", authenticateToken, (req, res) => {
       const issueResult = await pool.query(updateQuery, params);
       const issue = issueResult.rows[0];
 
+      // Handle new attachments
+      const attachments = [];
+      if (req.files && req.files['attachments']) {
+        for (const file of req.files['attachments']) {
+          const filePath = `/uploads/attachments/${file.filename}`;
+          const attachmentResult = await pool.query(
+            `INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
+             VALUES ($1, $2, $3)
+             RETURNING attachment_id, file_path, created_at`,
+            [issueId, userId, filePath]
+          );
+          attachments.push(attachmentResult.rows[0]);
+        }
+      }
+
       res.json({
         issue_id: issue.issue_id,
         title: issue.title,
@@ -350,7 +695,8 @@ app.put("/issues/:id", authenticateToken, (req, res) => {
         display_picture_url: issue.display_picture_url,
         upvote_count: issue.upvote_count,
         comment_count: issue.comment_count,
-        posted_at: issue.posted_at
+        posted_at: issue.posted_at,
+        attachments: attachments
       });
     } catch (error) {
       console.error("Error updating issue:", error);
@@ -541,6 +887,17 @@ app.post("/issues/:id/upvote", authenticateToken, async (req, res) => {
     const { id } = req.params;
     const userId = req.user.userId;
 
+    // Get user's role weight
+    const userRoleResult = await pool.query(
+      `SELECT r.upvote_weight 
+       FROM users u
+       JOIN roles r ON u.role_id = r.role_id
+       WHERE u.user_id = $1`,
+      [userId]
+    );
+
+    const upvoteWeight = userRoleResult.rows[0]?.upvote_weight || 1;
+
     // Check if user already upvoted
     const existingUpvote = await pool.query(
       `SELECT upvote_id FROM issue_upvotes WHERE issue_id = $1 AND user_id = $2`,
@@ -554,12 +911,12 @@ app.post("/issues/:id/upvote", authenticateToken, async (req, res) => {
         [id, userId]
       );
 
-      // Decrement count
+      // Decrement count by role weight
       const result = await pool.query(
-        `UPDATE issues SET upvote_count = upvote_count - 1 
-         WHERE issue_id = $1 
+        `UPDATE issues SET upvote_count = GREATEST(upvote_count - $1, 0)
+         WHERE issue_id = $2 
          RETURNING upvote_count`,
-        [id]
+        [upvoteWeight, id]
       );
 
       res.json({ upvoted: false, upvote_count: result.rows[0].upvote_count });
@@ -570,12 +927,12 @@ app.post("/issues/:id/upvote", authenticateToken, async (req, res) => {
         [id, userId]
       );
 
-      // Increment count
+      // Increment count by role weight
       const result = await pool.query(
-        `UPDATE issues SET upvote_count = upvote_count + 1 
-         WHERE issue_id = $1 
+        `UPDATE issues SET upvote_count = upvote_count + $1
+         WHERE issue_id = $2 
          RETURNING upvote_count`,
-        [id]
+        [upvoteWeight, id]
       );
 
       res.json({ upvoted: true, upvote_count: result.rows[0].upvote_count });
@@ -1200,29 +1557,35 @@ app.post("/group-join-requests", authenticateToken, async (req, res) => {
       });
     }
 
+    // Fetch issue and group info for authorization and auto-accept check
+    const issueCheck = await pool.query(
+      "SELECT user_id FROM issues WHERE issue_id = $1",
+      [issue_id]
+    );
+    if (issueCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Issue not found" });
+    }
+
+    const groupCheck = await pool.query(
+      "SELECT owner_id FROM groups WHERE group_id = $1",
+      [group_id]
+    );
+    if (groupCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    const issueOwnerId = issueCheck.rows[0].user_id;
+    const groupOwnerId = groupCheck.rows[0].owner_id;
+
     // Check authorization: either issue owner or group owner
     if (requested_by_group) {
       // Group owner is requesting to include an issue
-      const groupCheck = await pool.query(
-        "SELECT owner_id FROM groups WHERE group_id = $1",
-        [group_id]
-      );
-      if (groupCheck.rows.length === 0) {
-        return res.status(404).json({ error: "Group not found" });
-      }
-      if (groupCheck.rows[0].owner_id !== userId) {
+      if (groupOwnerId !== userId) {
         return res.status(403).json({ error: "Only group owner can make this request" });
       }
     } else {
       // Issue owner is requesting to join a group
-      const issueCheck = await pool.query(
-        "SELECT user_id FROM issues WHERE issue_id = $1",
-        [issue_id]
-      );
-      if (issueCheck.rows.length === 0) {
-        return res.status(404).json({ error: "Issue not found" });
-      }
-      if (issueCheck.rows[0].user_id !== userId) {
+      if (issueOwnerId !== userId) {
         return res.status(403).json({ error: "Only issue owner can make this request" });
       }
     }
@@ -1246,7 +1609,32 @@ app.post("/group-join-requests", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "A pending request already exists" });
     }
 
-    // Create the request
+    // AUTO-ACCEPT: If group owner is adding their own issue, auto-approve
+    const isOwnerAddingOwnIssue = (groupOwnerId === issueOwnerId && groupOwnerId === userId);
+
+    if (isOwnerAddingOwnIssue) {
+      // Directly add issue to group without creating a request
+      await pool.query(
+        "UPDATE issues SET group_id = $1 WHERE issue_id = $2",
+        [group_id, issue_id]
+      );
+
+      // Create an approved request record for history
+      const result = await pool.query(
+        `INSERT INTO group_join_request (issue_id, group_id, requested_by_group, status, requested_at, handled_at)
+         VALUES ($1, $2, $3, 'approved', NOW(), NOW())
+         RETURNING req_id, issue_id, group_id, requested_by_group, status, requested_at, handled_at`,
+        [issue_id, group_id, requested_by_group]
+      );
+
+      return res.status(201).json({
+        request: result.rows[0],
+        auto_accepted: true,
+        message: "Issue automatically added to your group"
+      });
+    }
+
+    // Create pending request (normal flow for other cases)
     const result = await pool.query(
       `INSERT INTO group_join_request (issue_id, group_id, requested_by_group, status, requested_at)
        VALUES ($1, $2, $3, 'pending', NOW())
