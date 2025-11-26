@@ -7,6 +7,7 @@ import { hashPassword, comparePassword, generateToken } from "./utils/auth.js";
 import { authenticateToken } from "./middleware/auth.js";
 import { authenticateAdmin } from "./middleware/adminAuth.js";
 import { uploadIssueFiles } from "./middleware/upload.js";
+import { uploadToSupabase, deleteFromSupabase, generateUniqueFileName, getSignedUrl, enrichWithSignedUrls } from "./utils/supabase.js";
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -792,23 +793,7 @@ app.post("/issues", authenticateToken, (req, res) => {
       return res.status(400).json({ error: err.message });
     }
 
-    const uploadedFiles = new Map();
-    const trackUpload = (bucket, storagePath) => {
-      if (!storagePath) return;
-      if (!uploadedFiles.has(bucket)) {
-        uploadedFiles.set(bucket, new Set());
-      }
-      uploadedFiles.get(bucket).add(storagePath);
-    };
-
-    const cleanupUploads = async () => {
-      await Promise.all(
-        Array.from(uploadedFiles.entries()).map(([bucket, paths]) =>
-          removeFromSupabase(bucket, Array.from(paths))
-        )
-      );
-    };
-
+    const uploadedFiles = [];
     let issue = null;
 
     try {
@@ -819,6 +804,7 @@ app.post("/issues", authenticateToken, (req, res) => {
         return res.status(400).json({ error: "Title and description are required" });
       }
 
+      // Create issue first
       const issueResult = await pool.query(
         `INSERT INTO issues (title, description, user_id, group_id, display_picture_url, upvote_count, comment_count)
          VALUES ($1, $2, $3, $4, $5, 0, 0)
@@ -828,68 +814,86 @@ app.post("/issues", authenticateToken, (req, res) => {
 
       issue = issueResult.rows[0];
 
-      let displayPictureUrl = null;
+      // Upload display picture if provided
       const displayPictures = req.files?.['display_picture'];
       if (displayPictures && displayPictures[0]) {
         const file = displayPictures[0];
-        const { storagePath, publicUrl } = await uploadToSupabase({
-          bucket: 'issues',
-          buffer: file.buffer,
-          originalName: file.originalname,
-          contentType: file.mimetype,
-          pathSegments: ['issues', issue.issue_id, 'display-picture']
+        const fileName = generateUniqueFileName(file.originalname, 'issue');
+
+        const { storagePath } = await uploadToSupabase({
+          bucket: 'uploads',
+          folder: 'issues',
+          file: file.buffer,
+          fileName,
+          contentType: file.mimetype
         });
-        trackUpload('issues', storagePath);
-        displayPictureUrl = publicUrl;
+
+        uploadedFiles.push({ bucket: 'uploads', path: storagePath });
 
         await pool.query(
           `UPDATE issues SET display_picture_url = $1 WHERE issue_id = $2`,
-          [displayPictureUrl, issue.issue_id]
+          [storagePath, issue.issue_id]
         );
-        issue.display_picture_url = displayPictureUrl;
+        issue.display_picture_url = storagePath;
       }
 
+      // Upload attachments
       const attachments = [];
       const attachmentFiles = req.files?.['attachments'] || [];
       for (const file of attachmentFiles) {
-        const { storagePath, publicUrl } = await uploadToSupabase({
-          bucket: 'attachments',
-          buffer: file.buffer,
-          originalName: file.originalname,
-          contentType: file.mimetype,
-          pathSegments: [issue.issue_id]
+        const fileName = generateUniqueFileName(file.originalname, 'attachment');
+
+        const { storagePath } = await uploadToSupabase({
+          bucket: 'uploads',
+          folder: 'attachments',
+          file: file.buffer,
+          fileName,
+          contentType: file.mimetype
         });
-        trackUpload('attachments', storagePath);
+
+        uploadedFiles.push({ bucket: 'uploads', path: storagePath });
 
         const attachmentResult = await pool.query(
           `INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
            VALUES ($1, $2, $3)
            RETURNING attachment_id, file_path, created_at`,
-          [issue.issue_id, userId, publicUrl]
+          [issue.issue_id, userId, storagePath]
         );
         attachments.push(attachmentResult.rows[0]);
       }
 
+      // Generate signed URLs for response
+      const enrichedIssue = await enrichWithSignedUrls(issue);
+      const enrichedAttachments = await Promise.all(
+        attachments.map(async (att) => ({
+          ...att,
+          file_path: await getSignedUrl('uploads', att.file_path)
+        }))
+      );
+
       res.status(201).json({
-        issue_id: issue.issue_id,
-        title: issue.title,
-        description: issue.description,
-        user_id: issue.user_id,
-        group_id: issue.group_id,
-        display_picture_url: issue.display_picture_url,
-        upvote_count: issue.upvote_count,
-        comment_count: issue.comment_count,
-        posted_at: issue.posted_at,
-        attachments
+        issue_id: enrichedIssue.issue_id,
+        title: enrichedIssue.title,
+        description: enrichedIssue.description,
+        user_id: enrichedIssue.user_id,
+        group_id: enrichedIssue.group_id,
+        display_picture_url: enrichedIssue.display_picture_url,
+        upvote_count: enrichedIssue.upvote_count,
+        comment_count: enrichedIssue.comment_count,
+        posted_at: enrichedIssue.posted_at,
+        attachments: enrichedAttachments
       });
     } catch (error) {
       console.error("Error creating issue:", error);
-      await cleanupUploads().catch(() => { });
 
+      // Cleanup uploaded files
+      for (const { bucket, path } of uploadedFiles) {
+        await deleteFromSupabase(bucket, path).catch(() => { });
+      }
+
+      // Cleanup database entries
       if (issue?.issue_id) {
-        await pool.query(`DELETE FROM post_attachments WHERE issue_id = $1`, [issue.issue_id]).catch(
-          () => { }
-        );
+        await pool.query(`DELETE FROM post_attachments WHERE issue_id = $1`, [issue.issue_id]).catch(() => { });
         await pool.query(`DELETE FROM issues WHERE issue_id = $1`, [issue.issue_id]).catch(() => { });
       }
 
@@ -906,6 +910,8 @@ app.put("/issues/:id", authenticateToken, (req, res) => {
       return res.status(400).json({ error: err.message });
     }
 
+    const uploadedFiles = [];
+
     try {
       const issueId = req.params.id;
       const { title, description } = req.body;
@@ -917,7 +923,7 @@ app.put("/issues/:id", authenticateToken, (req, res) => {
 
       // Check if user owns the issue
       const ownerCheck = await pool.query(
-        "SELECT user_id FROM issues WHERE issue_id = $1",
+        "SELECT user_id, display_picture_url FROM issues WHERE issue_id = $1",
         [issueId]
       );
 
@@ -929,11 +935,29 @@ app.put("/issues/:id", authenticateToken, (req, res) => {
         return res.status(403).json({ error: "You can only edit your own issues" });
       }
 
-      // Get new display picture path if uploaded
       let displayPictureUrl = undefined;
+      const oldDisplayPicture = ownerCheck.rows[0].display_picture_url;
+
+      // Upload new display picture if provided
       if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
         const file = req.files['display_picture'][0];
-        displayPictureUrl = `/uploads/issues/${file.filename}`;
+        const fileName = generateUniqueFileName(file.originalname, 'issue');
+
+        const { storagePath } = await uploadToSupabase({
+          bucket: 'uploads',
+          folder: 'issues',
+          file: file.buffer,
+          fileName,
+          contentType: file.mimetype
+        });
+
+        uploadedFiles.push({ bucket: 'uploads', path: storagePath });
+        displayPictureUrl = storagePath;
+
+        // Delete old display picture if it exists
+        if (oldDisplayPicture) {
+          await deleteFromSupabase('uploads', oldDisplayPicture).catch(() => { });
+        }
       }
 
       // Update issue
@@ -951,31 +975,57 @@ app.put("/issues/:id", authenticateToken, (req, res) => {
       const attachments = [];
       if (req.files && req.files['attachments']) {
         for (const file of req.files['attachments']) {
-          const filePath = `/uploads/attachments/${file.filename}`;
+          const fileName = generateUniqueFileName(file.originalname, 'attachment');
+
+          const { storagePath } = await uploadToSupabase({
+            bucket: 'uploads',
+            folder: 'attachments',
+            file: file.buffer,
+            fileName,
+            contentType: file.mimetype
+          });
+
+          uploadedFiles.push({ bucket: 'uploads', path: storagePath });
+
           const attachmentResult = await pool.query(
             `INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
              VALUES ($1, $2, $3)
              RETURNING attachment_id, file_path, created_at`,
-            [issueId, userId, filePath]
+            [issueId, userId, storagePath]
           );
           attachments.push(attachmentResult.rows[0]);
         }
       }
 
+      // Generate signed URLs for response
+      const enrichedIssue = await enrichWithSignedUrls(issue);
+      const enrichedAttachments = await Promise.all(
+        attachments.map(async (att) => ({
+          ...att,
+          file_path: await getSignedUrl('uploads', att.file_path)
+        }))
+      );
+
       res.json({
-        issue_id: issue.issue_id,
-        title: issue.title,
-        description: issue.description,
-        user_id: issue.user_id,
-        group_id: issue.group_id,
-        display_picture_url: issue.display_picture_url,
-        upvote_count: issue.upvote_count,
-        comment_count: issue.comment_count,
-        posted_at: issue.posted_at,
-        attachments: attachments
+        issue_id: enrichedIssue.issue_id,
+        title: enrichedIssue.title,
+        description: enrichedIssue.description,
+        user_id: enrichedIssue.user_id,
+        group_id: enrichedIssue.group_id,
+        display_picture_url: enrichedIssue.display_picture_url,
+        upvote_count: enrichedIssue.upvote_count,
+        comment_count: enrichedIssue.comment_count,
+        posted_at: enrichedIssue.posted_at,
+        attachments: enrichedAttachments
       });
     } catch (error) {
       console.error("Error updating issue:", error);
+
+      // Cleanup uploaded files on error
+      for (const { bucket, path } of uploadedFiles) {
+        await deleteFromSupabase(bucket, path).catch(() => { });
+      }
+
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -1049,9 +1099,14 @@ app.get("/issues/feed", authenticateToken, async (req, res) => {
     ].sort((a, b) => new Date(b.posted_at) - new Date(a.posted_at))
       .slice(0, limit);
 
+    // Generate signed URLs for all items
+    const enrichedItems = await Promise.all(
+      combined.map(async (item) => await enrichWithSignedUrls(item))
+    );
+
     res.json({
-      items: combined,
-      count: combined.length
+      items: enrichedItems,
+      count: enrichedItems.length
     });
   } catch (error) {
     console.error("Error fetching feed:", error);
@@ -1341,6 +1396,8 @@ app.post("/groups", authenticateToken, (req, res) => {
       return res.status(400).json({ error: err.message });
     }
 
+    let uploadedFile = null;
+
     try {
       const { name, description } = req.body;
       const userId = req.user.userId;
@@ -1349,11 +1406,21 @@ app.post("/groups", authenticateToken, (req, res) => {
         return res.status(400).json({ error: "Name is required" });
       }
 
-      // Get display picture path if uploaded
       let displayPictureUrl = null;
       if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
         const file = req.files['display_picture'][0];
-        displayPictureUrl = `/uploads/issues/${file.filename}`;
+        const fileName = generateUniqueFileName(file.originalname, 'group');
+
+        const { storagePath } = await uploadToSupabase({
+          bucket: 'uploads',
+          folder: 'issues',
+          file: file.buffer,
+          fileName,
+          contentType: file.mimetype
+        });
+
+        uploadedFile = { bucket: 'uploads', path: storagePath };
+        displayPictureUrl = storagePath;
       }
 
       // Insert group
@@ -1365,19 +1432,26 @@ app.post("/groups", authenticateToken, (req, res) => {
       );
 
       const group = result.rows[0];
+      const enrichedGroup = await enrichWithSignedUrls(group);
 
       res.status(201).json({
-        group_id: group.group_id,
-        name: group.name,
-        description: group.description,
-        owner_id: group.owner_id,
-        display_picture_url: group.display_picture_url,
-        upvote_count: group.upvote_count,
-        comment_count: group.comment_count,
-        created_at: group.created_at
+        group_id: enrichedGroup.group_id,
+        name: enrichedGroup.name,
+        description: enrichedGroup.description,
+        owner_id: enrichedGroup.owner_id,
+        display_picture_url: enrichedGroup.display_picture_url,
+        upvote_count: enrichedGroup.upvote_count,
+        comment_count: enrichedGroup.comment_count,
+        created_at: enrichedGroup.created_at
       });
     } catch (error) {
       console.error("Error creating group:", error);
+
+      // Cleanup uploaded file on error
+      if (uploadedFile) {
+        await deleteFromSupabase(uploadedFile.bucket, uploadedFile.path).catch(() => { });
+      }
+
       res.status(500).json({ error: "Internal server error" });
     }
   });
@@ -1391,6 +1465,8 @@ app.put("/groups/:id", authenticateToken, (req, res) => {
       return res.status(400).json({ error: err.message });
     }
 
+    let uploadedFile = null;
+
     try {
       const groupId = req.params.id;
       const { name, description } = req.body;
@@ -1402,7 +1478,7 @@ app.put("/groups/:id", authenticateToken, (req, res) => {
 
       // Check if user owns the group
       const ownerCheck = await pool.query(
-        "SELECT owner_id FROM groups WHERE group_id = $1",
+        "SELECT owner_id, display_picture_url FROM groups WHERE group_id = $1",
         [groupId]
       );
 
@@ -1414,11 +1490,29 @@ app.put("/groups/:id", authenticateToken, (req, res) => {
         return res.status(403).json({ error: "You can only edit your own groups" });
       }
 
-      // Get new display picture path if uploaded
       let displayPictureUrl = undefined;
+      const oldDisplayPicture = ownerCheck.rows[0].display_picture_url;
+
+      // Upload new display picture if provided
       if (req.files && req.files['display_picture'] && req.files['display_picture'][0]) {
         const file = req.files['display_picture'][0];
-        displayPictureUrl = `/uploads/issues/${file.filename}`;
+        const fileName = generateUniqueFileName(file.originalname, 'group');
+
+        const { storagePath } = await uploadToSupabase({
+          bucket: 'uploads',
+          folder: 'issues',
+          file: file.buffer,
+          fileName,
+          contentType: file.mimetype
+        });
+
+        uploadedFile = { bucket: 'uploads', path: storagePath };
+        displayPictureUrl = storagePath;
+
+        // Delete old display picture if it exists
+        if (oldDisplayPicture) {
+          await deleteFromSupabase('uploads', oldDisplayPicture).catch(() => { });
+        }
       }
 
       // Update group
@@ -1432,18 +1526,26 @@ app.put("/groups/:id", authenticateToken, (req, res) => {
       const result = await pool.query(updateQuery, params);
       const group = result.rows[0];
 
+      const enrichedGroup = await enrichWithSignedUrls(group);
+
       res.json({
-        group_id: group.group_id,
-        name: group.name,
-        description: group.description,
-        owner_id: group.owner_id,
-        display_picture_url: group.display_picture_url,
-        upvote_count: group.upvote_count,
-        comment_count: group.comment_count,
-        created_at: group.created_at
+        group_id: enrichedGroup.group_id,
+        name: enrichedGroup.name,
+        description: enrichedGroup.description,
+        owner_id: enrichedGroup.owner_id,
+        display_picture_url: enrichedGroup.display_picture_url,
+        upvote_count: enrichedGroup.upvote_count,
+        comment_count: enrichedGroup.comment_count,
+        created_at: enrichedGroup.created_at
       });
     } catch (error) {
       console.error("Error updating group:", error);
+
+      // Cleanup uploaded file on error
+      if (uploadedFile) {
+        await deleteFromSupabase(uploadedFile.bucket, uploadedFile.path).catch(() => { });
+      }
+
       res.status(500).json({ error: "Internal server error" });
     }
   });
