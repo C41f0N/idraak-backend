@@ -1052,6 +1052,91 @@ app.get("/issues/feed", authenticateToken, async (req, res) => {
   }
 });
 
+// Get popular feed (sorted by upvotes)
+app.get("/issues/feed/popular", authenticateToken, async (req, res) => {
+  try {
+    const limit = 20; // Fixed limit for feed
+
+    // Fetch popular issues (not in groups) sorted by upvote_count
+    const issuesQuery = `
+      SELECT 
+        i.issue_id as id, i.title, i.description, i.user_id, 
+        i.display_picture_url, i.upvote_count, i.comment_count, i.posted_at,
+        u.username, u.full_name,
+        'issue' as item_type
+      FROM issues i
+      JOIN users u ON i.user_id = u.user_id
+      WHERE i.group_id IS NULL
+      ORDER BY i.upvote_count DESC, i.posted_at DESC 
+      LIMIT $1
+    `;
+
+    // Fetch popular groups sorted by upvote_count
+    const groupsQuery = `
+      SELECT 
+        g.group_id as id, g.name as title, g.description, g.owner_id as user_id,
+        g.display_picture_url, g.upvote_count, g.comment_count, g.created_at as posted_at,
+        u.username, u.full_name,
+        'group' as item_type
+      FROM groups g
+      JOIN users u ON g.owner_id = u.user_id
+      ORDER BY g.upvote_count DESC, g.created_at DESC 
+      LIMIT $1
+    `;
+
+    const [issuesResult, groupsResult] = await Promise.all([
+      pool.query(issuesQuery, [limit]),
+      pool.query(groupsQuery, [limit])
+    ]);
+
+    // Combine and sort by popularity (upvote_count)
+    const combined = [
+      ...issuesResult.rows.map(row => ({
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        display_picture_url: row.display_picture_url,
+        upvote_count: row.upvote_count,
+        comment_count: row.comment_count,
+        posted_at: row.posted_at,
+        item_type: 'issue'
+      })),
+      ...groupsResult.rows.map(row => ({
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        user_id: row.user_id,
+        username: row.username,
+        full_name: row.full_name,
+        display_picture_url: row.display_picture_url,
+        upvote_count: row.upvote_count,
+        comment_count: row.comment_count,
+        posted_at: row.posted_at,
+        item_type: 'group'
+      }))
+    ].sort((a, b) => {
+      // Primary sort: upvote_count (descending)
+      if (b.upvote_count !== a.upvote_count) {
+        return b.upvote_count - a.upvote_count;
+      }
+      // Secondary sort: posted_at (descending) for tie-breaking
+      return new Date(b.posted_at) - new Date(a.posted_at);
+    })
+      .slice(0, limit);
+
+    res.json({
+      items: combined,
+      count: combined.length
+    });
+  } catch (error) {
+    console.error("Error fetching popular feed:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // Get all issues with pagination
 app.get("/issues", authenticateToken, async (req, res) => {
   try {
