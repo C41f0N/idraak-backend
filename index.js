@@ -1255,7 +1255,7 @@ app.get("/issues/:id", authenticateToken, async (req, res) => {
       `SELECT 
         i.issue_id, i.title, i.description, i.user_id, i.group_id,
         i.display_picture_url, i.upvote_count, i.comment_count, i.posted_at,
-        u.username, u.full_name
+        u.username, u.full_name, u.profile_picture_url
       FROM issues i
       JOIN users u ON i.user_id = u.user_id
       WHERE i.issue_id = $1`,
@@ -1290,6 +1290,7 @@ app.get("/issues/:id", authenticateToken, async (req, res) => {
       user_id: issue.user_id,
       username: issue.username,
       full_name: issue.full_name,
+      profile_picture_url: issue.profile_picture_url,
       group_id: issue.group_id,
       display_picture_url: issue.display_picture_url,
       upvote_count: issue.upvote_count,
@@ -1623,7 +1624,7 @@ app.get("/groups/:id", authenticateToken, async (req, res) => {
       `SELECT 
         g.group_id, g.name, g.description, g.owner_id, g.display_picture_url,
         g.upvote_count, g.comment_count, g.created_at,
-        u.username, u.full_name
+        u.username, u.full_name, u.profile_picture_url
        FROM groups g
        JOIN users u ON g.owner_id = u.user_id
        WHERE g.group_id = $1`,
@@ -1652,6 +1653,7 @@ app.get("/groups/:id", authenticateToken, async (req, res) => {
       owner_id: group.owner_id,
       username: group.username,
       full_name: group.full_name,
+      profile_picture_url: group.profile_picture_url,
       display_picture_url: group.display_picture_url,
       upvote_count: group.upvote_count,
       comment_count: group.comment_count,
