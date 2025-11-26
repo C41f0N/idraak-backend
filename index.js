@@ -1409,6 +1409,38 @@ app.post("/issues/:id/comments", authenticateToken, async (req, res) => {
   }
 });
 
+// Delete an issue
+app.delete("/issues/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    // Check if issue exists and verify ownership
+    const ownerCheck = await pool.query(
+      "SELECT user_id FROM issues WHERE issue_id = $1",
+      [id]
+    );
+
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Issue not found" });
+    }
+
+    if (ownerCheck.rows[0].user_id !== userId) {
+      return res.status(403).json({ error: "You can only delete your own issues" });
+    }
+
+    // Delete the issue (cascade will handle comments, upvotes, attachments)
+    await pool.query("DELETE FROM issues WHERE issue_id = $1", [id]);
+
+    res.json({ message: "Issue deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting issue:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
 // ============ GROUP ROUTES ============
 
 // Create a new group with optional display picture
@@ -1685,6 +1717,36 @@ app.get("/groups/:id/upvotes", authenticateToken, async (req, res) => {
     });
   } catch (error) {
     console.error("Error fetching group upvotes:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Delete a group
+app.delete("/groups/:id", authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.userId;
+
+    // Check if group exists and verify ownership
+    const ownerCheck = await pool.query(
+      "SELECT owner_id FROM groups WHERE group_id = $1",
+      [id]
+    );
+
+    if (ownerCheck.rows.length === 0) {
+      return res.status(404).json({ error: "Group not found" });
+    }
+
+    if (ownerCheck.rows[0].owner_id !== userId) {
+      return res.status(403).json({ error: "You can only delete your own groups" });
+    }
+
+    // Delete the group (cascade will handle upvotes, join requests; issues will have group_id set to NULL)
+    await pool.query("DELETE FROM groups WHERE group_id = $1", [id]);
+
+    res.json({ message: "Group deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting group:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
