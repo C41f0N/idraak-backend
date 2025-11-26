@@ -2,6 +2,7 @@ import express from "express";
 import pkg from "pg";
 import dotenv from "dotenv";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
 import { hashPassword, comparePassword, generateToken } from "./utils/auth.js";
 import { authenticateToken } from "./middleware/auth.js";
@@ -792,20 +793,23 @@ app.post("/issues", authenticateToken, (req, res) => {
       return res.status(400).json({ error: err.message });
     }
 
-    const uploadedFiles = new Map();
-    const trackUpload = (bucket, storagePath) => {
-      if (!storagePath) return;
-      if (!uploadedFiles.has(bucket)) {
-        uploadedFiles.set(bucket, new Set());
+    const uploadedFiles = [];
+    const trackUpload = (filePath) => {
+      if (filePath) {
+        uploadedFiles.push(filePath);
       }
-      uploadedFiles.get(bucket).add(storagePath);
     };
 
     const cleanupUploads = async () => {
       await Promise.all(
-        Array.from(uploadedFiles.entries()).map(([bucket, paths]) =>
-          removeFromSupabase(bucket, Array.from(paths))
-        )
+        uploadedFiles.map((filePath) => {
+          return new Promise((resolve) => {
+            fs.unlink(filePath, (err) => {
+              if (err) console.error(`Error deleting file ${filePath}:`, err);
+              resolve();
+            });
+          });
+        })
       );
     };
 
@@ -832,15 +836,9 @@ app.post("/issues", authenticateToken, (req, res) => {
       const displayPictures = req.files?.['display_picture'];
       if (displayPictures && displayPictures[0]) {
         const file = displayPictures[0];
-        const { storagePath, publicUrl } = await uploadToSupabase({
-          bucket: 'issues',
-          buffer: file.buffer,
-          originalName: file.originalname,
-          contentType: file.mimetype,
-          pathSegments: ['issues', issue.issue_id, 'display-picture']
-        });
-        trackUpload('issues', storagePath);
-        displayPictureUrl = publicUrl;
+        // Multer already saved the file, use the path it provides
+        displayPictureUrl = `/uploads/issues/${file.filename}`;
+        trackUpload(file.path);
 
         await pool.query(
           `UPDATE issues SET display_picture_url = $1 WHERE issue_id = $2`,
@@ -852,14 +850,9 @@ app.post("/issues", authenticateToken, (req, res) => {
       const attachments = [];
       const attachmentFiles = req.files?.['attachments'] || [];
       for (const file of attachmentFiles) {
-        const { storagePath, publicUrl } = await uploadToSupabase({
-          bucket: 'attachments',
-          buffer: file.buffer,
-          originalName: file.originalname,
-          contentType: file.mimetype,
-          pathSegments: [issue.issue_id]
-        });
-        trackUpload('attachments', storagePath);
+        // Multer already saved the file, use the path it provides
+        const publicUrl = `/uploads/attachments/${file.filename}`;
+        trackUpload(file.path);
 
         const attachmentResult = await pool.query(
           `INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
