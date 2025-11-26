@@ -7,7 +7,7 @@ import { fileURLToPath } from "url";
 import { hashPassword, comparePassword, generateToken } from "./utils/auth.js";
 import { authenticateToken } from "./middleware/auth.js";
 import { authenticateAdmin } from "./middleware/adminAuth.js";
-import { uploadIssueFiles } from "./middleware/upload.js";
+import { uploadIssueFiles, uploadProfilePicture } from "./middleware/upload.js";
 
 
 const __filename = fileURLToPath(import.meta.url);
@@ -200,7 +200,7 @@ app.post("/auth/login", async (req, res) => {
 app.get("/auth/me", authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT user_id, email, username, full_name, role_id, created_at 
+      `SELECT user_id, email, username, full_name, role_id, created_at, profile_picture_url 
        FROM users WHERE user_id = $1`,
       [req.user.userId]
     );
@@ -217,13 +217,81 @@ app.get("/auth/me", authenticateToken, async (req, res) => {
         username: user.username,
         full_name: user.full_name,
         role_id: user.role_id,
-        created_at: user.created_at
+        created_at: user.created_at,
+        profile_picture_url: user.profile_picture_url
       }
     });
   } catch (err) {
     console.error("Error fetching user:", err);
     res.status(500).json({ error: "Internal server error" });
   }
+});
+
+// Upload profile picture
+app.post("/users/profile-picture", authenticateToken, (req, res) => {
+  // Use dedicated profile-picture uploader. Keep backward compatibility with
+  // previous field name `display_picture` by falling back to it if provided.
+  uploadProfilePicture(req, res, async (err) => {
+    if (err) {
+      console.error("Upload error:", err);
+      return res.status(400).json({ error: err.message });
+    }
+
+    try {
+      const userId = req.user.userId;
+
+      // Multer fields stores files in req.files; accept either new
+      // `profile_picture` or legacy `display_picture` for backward compat.
+      let file = null;
+      if (req.file) {
+        file = req.file;
+      } else if (req.files) {
+        file = (req.files['profile_picture'] && req.files['profile_picture'][0])
+          || (req.files['display_picture'] && req.files['display_picture'][0])
+          || null;
+      }
+
+      if (!file) {
+        return res.status(400).json({ error: "No profile picture uploaded" });
+      }
+
+      // Determine URL based on storage folder
+      let profilePictureUrl;
+      if (file.path && file.path.includes('/uploads/issues/')) {
+        // older uploads that wound up in issues folder
+        profilePictureUrl = `/uploads/issues/${file.filename}`;
+      } else {
+        profilePictureUrl = `/uploads/profile_pictures/${file.filename}`;
+      }
+
+      // Update user's profile picture
+      const result = await pool.query(
+        `UPDATE users SET profile_picture_url = $1 WHERE user_id = $2
+         RETURNING user_id, email, username, full_name, role_id, created_at, profile_picture_url`,
+        [profilePictureUrl, userId]
+      );
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      const user = result.rows[0];
+      res.json({
+        user: {
+          id: user.user_id,
+          email: user.email,
+          username: user.username,
+          full_name: user.full_name,
+          role_id: user.role_id,
+          created_at: user.created_at,
+          profile_picture_url: user.profile_picture_url
+        }
+      });
+    } catch (error) {
+      console.error("Error updating profile picture:", error);
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
 });
 
 // ============ ADMIN ROUTES ============
@@ -1241,55 +1309,17 @@ app.post("/issues/:id/upvote", authenticateToken, async (req, res) => {
     const { id } = req.params;
     const userId = req.user.userId;
 
-    // Get user's role weight
-    const userRoleResult = await pool.query(
-      `SELECT r.upvote_weight 
-       FROM users u
-       JOIN roles r ON u.role_id = r.role_id
-       WHERE u.user_id = $1`,
-      [userId]
-    );
-
-    const upvoteWeight = userRoleResult.rows[0]?.upvote_weight || 1;
-
-    // Check if user already upvoted
-    const existingUpvote = await pool.query(
-      `SELECT upvote_id FROM issue_upvotes WHERE issue_id = $1 AND user_id = $2`,
+    // Use stored procedure to toggle upvote atomically
+    const result = await pool.query(
+      `SELECT * FROM toggle_issue_upvote($1, $2)`,
       [id, userId]
     );
 
-    if (existingUpvote.rows.length > 0) {
-      // Remove upvote
-      await pool.query(
-        `DELETE FROM issue_upvotes WHERE issue_id = $1 AND user_id = $2`,
-        [id, userId]
-      );
-
-      // Decrement count by role weight
-      const result = await pool.query(
-        `UPDATE issues SET upvote_count = GREATEST(upvote_count - $1, 0)
-         WHERE issue_id = $2 
-         RETURNING upvote_count`,
-        [upvoteWeight, id]
-      );
-
-      res.json({ upvoted: false, upvote_count: result.rows[0].upvote_count });
+    if (result.rows.length > 0) {
+      const { upvoted, upvote_count } = result.rows[0];
+      res.json({ upvoted, upvote_count });
     } else {
-      // Add upvote
-      await pool.query(
-        `INSERT INTO issue_upvotes (issue_id, user_id) VALUES ($1, $2)`,
-        [id, userId]
-      );
-
-      // Increment count by role weight
-      const result = await pool.query(
-        `UPDATE issues SET upvote_count = upvote_count + $1
-         WHERE issue_id = $2 
-         RETURNING upvote_count`,
-        [upvoteWeight, id]
-      );
-
-      res.json({ upvoted: true, upvote_count: result.rows[0].upvote_count });
+      res.status(404).json({ error: "Issue not found" });
     }
   } catch (error) {
     console.error("Error toggling upvote:", error);
@@ -1371,7 +1401,7 @@ app.post("/issues/:id/comments", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Comment content is required" });
     }
 
-    // Insert comment
+    // Insert comment (trigger will automatically update comment_count)
     const result = await pool.query(
       `INSERT INTO comments (issue_id, user_id, content)
        VALUES ($1, $2, $3)
@@ -1383,12 +1413,6 @@ app.post("/issues/:id/comments", authenticateToken, async (req, res) => {
     const userResult = await pool.query(
       `SELECT username, full_name FROM users WHERE user_id = $1`,
       [userId]
-    );
-
-    // Update comment count on issue
-    await pool.query(
-      `UPDATE issues SET comment_count = comment_count + 1 WHERE issue_id = $1`,
-      [id]
     );
 
     const comment = result.rows[0];
@@ -1568,9 +1592,8 @@ app.get("/groups", authenticateToken, async (req, res) => {
     const result = await pool.query(
       `SELECT 
         g.group_id, g.name, g.description, g.owner_id, g.display_picture_url,
-        g.upvote_count, g.comment_count, g.created_at,
-        u.username, u.full_name,
-        (SELECT COUNT(*) FROM issues WHERE group_id = g.group_id) as issue_count
+        g.upvote_count, g.comment_count, g.created_at, g.issue_count,
+        u.username, u.full_name
        FROM groups g
        JOIN users u ON g.owner_id = u.user_id
        ORDER BY g.created_at DESC 
@@ -1647,44 +1670,17 @@ app.post("/groups/:id/upvote", authenticateToken, async (req, res) => {
     const { id } = req.params;
     const userId = req.user.userId;
 
-    // Check if user already upvoted
-    const existingUpvote = await pool.query(
-      `SELECT group_upvote_id FROM group_upvotes WHERE group_id = $1 AND user_id = $2`,
+    // Use stored procedure to toggle upvote atomically
+    const result = await pool.query(
+      `SELECT * FROM toggle_group_upvote($1, $2)`,
       [id, userId]
     );
 
-    if (existingUpvote.rows.length > 0) {
-      // Remove upvote
-      await pool.query(
-        `DELETE FROM group_upvotes WHERE group_id = $1 AND user_id = $2`,
-        [id, userId]
-      );
-
-      // Decrement count
-      const result = await pool.query(
-        `UPDATE groups SET upvote_count = upvote_count - 1 
-         WHERE group_id = $1 
-         RETURNING upvote_count`,
-        [id]
-      );
-
-      res.json({ upvoted: false, upvote_count: result.rows[0].upvote_count });
+    if (result.rows.length > 0) {
+      const { upvoted, upvote_count } = result.rows[0];
+      res.json({ upvoted, upvote_count });
     } else {
-      // Add upvote
-      await pool.query(
-        `INSERT INTO group_upvotes (group_id, user_id) VALUES ($1, $2)`,
-        [id, userId]
-      );
-
-      // Increment count
-      const result = await pool.query(
-        `UPDATE groups SET upvote_count = upvote_count + 1 
-         WHERE group_id = $1 
-         RETURNING upvote_count`,
-        [id]
-      );
-
-      res.json({ upvoted: true, upvote_count: result.rows[0].upvote_count });
+      res.status(404).json({ error: "Group not found" });
     }
   } catch (error) {
     console.error("Error toggling group upvote:", error);
@@ -1794,7 +1790,7 @@ app.post("/groups/:id/comments", authenticateToken, async (req, res) => {
       return res.status(400).json({ error: "Comment content is required" });
     }
 
-    // Insert comment
+    // Insert comment (trigger will automatically update comment_count)
     const result = await pool.query(
       `INSERT INTO group_comments (group_id, user_id, content)
        VALUES ($1, $2, $3)
@@ -1806,12 +1802,6 @@ app.post("/groups/:id/comments", authenticateToken, async (req, res) => {
     const userResult = await pool.query(
       `SELECT username, full_name FROM users WHERE user_id = $1`,
       [userId]
-    );
-
-    // Update comment count on group
-    await pool.query(
-      `UPDATE groups SET comment_count = comment_count + 1 WHERE group_id = $1`,
-      [id]
     );
 
     const comment = result.rows[0];
@@ -1840,7 +1830,7 @@ app.get("/users/:id", authenticateToken, async (req, res) => {
     const { id } = req.params;
 
     const result = await pool.query(
-      `SELECT u.user_id, u.username, u.email, u.full_name, u.role_id, u.created_at,
+      `SELECT u.user_id, u.username, u.email, u.full_name, u.role_id, u.created_at, u.profile_picture_url,
               r.title as role_title, r.description as role_description
        FROM users u
        LEFT JOIN roles r ON u.role_id = r.role_id
@@ -1861,7 +1851,8 @@ app.get("/users/:id", authenticateToken, async (req, res) => {
       role_id: user.role_id,
       role_title: user.role_title,
       role_description: user.role_description,
-      created_at: user.created_at
+      created_at: user.created_at,
+      profile_picture_url: user.profile_picture_url
     });
   } catch (error) {
     console.error("Error fetching user:", error);
@@ -2350,8 +2341,7 @@ app.get("/search", authenticateToken, async (req, res) => {
         SELECT 
           g.group_id, g.name as title, g.description, g.owner_id as user_id,
           g.display_picture_url, g.upvote_count, g.comment_count, g.created_at as posted_at,
-          u.username, u.full_name,
-          (SELECT COUNT(*) FROM issues WHERE group_id = g.group_id) as issue_count
+          u.username, u.full_name, g.issue_count
         FROM groups g
         JOIN users u ON g.owner_id = u.user_id
         WHERE g.name ILIKE $1 OR g.description ILIKE $1

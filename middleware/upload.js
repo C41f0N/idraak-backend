@@ -10,8 +10,9 @@ const __dirname = path.dirname(__filename);
 const uploadsDir = path.join(__dirname, '../uploads');
 const issuesDir = path.join(uploadsDir, 'issues');
 const attachmentsDir = path.join(uploadsDir, 'attachments');
+const profileDir = path.join(uploadsDir, 'profile_pictures');
 
-[uploadsDir, issuesDir, attachmentsDir].forEach(dir => {
+[uploadsDir, issuesDir, attachmentsDir, profileDir].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
@@ -68,8 +69,26 @@ const attachmentFilter = (req, file, cb) => {
 export const uploadIssueImage = multer({
     storage: issueStorage,
     limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
-    fileFilter: imageFilter
+    // fileFilter: imageFilter
 }).single('display_picture');
+
+// Multer config for profile pictures (separate folder)
+export const uploadProfilePicture = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => {
+            cb(null, profileDir);
+        },
+        filename: (req, file, cb) => {
+            const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+            cb(null, 'profile-' + uniqueSuffix + path.extname(file.originalname));
+        }
+    }),
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+    // fileFilter: imageFilter
+}).fields([
+    { name: 'profile_picture', maxCount: 1 },
+    { name: 'display_picture', maxCount: 1 }
+]);
 
 // Combined upload with custom storage per field
 export const uploadIssueFiles = multer({

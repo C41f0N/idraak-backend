@@ -20,8 +20,8 @@ CREATE TABLE public."admin" (
 
 -- Permissions
 
-ALTER TABLE public."admin" OWNER TO sarim;
-GRANT ALL ON TABLE public."admin" TO sarim;
+ALTER TABLE public."admin" OWNER TO postgres;
+GRANT ALL ON TABLE public."admin" TO postgres;
 
 
 -- public.roles definition
@@ -40,8 +40,8 @@ CREATE TABLE public.roles (
 
 -- Permissions
 
-ALTER TABLE public.roles OWNER TO sarim;
-GRANT ALL ON TABLE public.roles TO sarim;
+ALTER TABLE public.roles OWNER TO postgres;
+GRANT ALL ON TABLE public.roles TO postgres;
 
 
 -- public.users definition
@@ -58,6 +58,7 @@ CREATE TABLE public.users (
 	created_at timestamptz DEFAULT now() NOT NULL,
 	username text NOT NULL,
 	password_hash text DEFAULT ''::text NOT NULL,
+	profile_picture_url varchar NULL,
 	CONSTRAINT users_email_key UNIQUE (email),
 	CONSTRAINT users_pkey PRIMARY KEY (user_id),
 	CONSTRAINT users_username_key UNIQUE (username),
@@ -66,8 +67,8 @@ CREATE TABLE public.users (
 
 -- Permissions
 
-ALTER TABLE public.users OWNER TO sarim;
-GRANT ALL ON TABLE public.users TO sarim;
+ALTER TABLE public.users OWNER TO postgres;
+GRANT ALL ON TABLE public.users TO postgres;
 
 
 -- public."groups" definition
@@ -85,14 +86,15 @@ CREATE TABLE public."groups" (
 	upvote_count int4 DEFAULT 0 NOT NULL,
 	comment_count int4 DEFAULT 0 NOT NULL,
 	display_picture_url text NULL,
+	issue_count int4 DEFAULT 0 NULL,
 	CONSTRAINT groups_pkey PRIMARY KEY (group_id),
 	CONSTRAINT groups_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
 
 -- Permissions
 
-ALTER TABLE public."groups" OWNER TO sarim;
-GRANT ALL ON TABLE public."groups" TO sarim;
+ALTER TABLE public."groups" OWNER TO postgres;
+GRANT ALL ON TABLE public."groups" TO postgres;
 
 
 -- public.issues definition
@@ -119,10 +121,28 @@ CREATE INDEX idx_issues_group_id ON public.issues USING btree (group_id);
 CREATE INDEX idx_issues_posted_at ON public.issues USING btree (posted_at DESC);
 CREATE INDEX idx_issues_user_id ON public.issues USING btree (user_id);
 
+-- Table Triggers
+
+create trigger trg_issue_delete_group_count after
+delete
+    on
+    public.issues for each row execute function trg_delete_issue_group_count();
+create trigger trg_issue_insert_group_count after
+insert
+    on
+    public.issues for each row execute function trg_inc_group_issue_count_on_insert();
+create trigger trg_issue_update_group_count after
+update
+    of group_id on
+    public.issues for each row
+    when ((old.group_id is distinct
+from
+    new.group_id)) execute function trg_update_issue_group_count();
+
 -- Permissions
 
-ALTER TABLE public.issues OWNER TO sarim;
-GRANT ALL ON TABLE public.issues TO sarim;
+ALTER TABLE public.issues OWNER TO postgres;
+GRANT ALL ON TABLE public.issues TO postgres;
 
 
 -- public.post_attachments definition
@@ -144,8 +164,8 @@ CREATE TABLE public.post_attachments (
 
 -- Permissions
 
-ALTER TABLE public.post_attachments OWNER TO sarim;
-GRANT ALL ON TABLE public.post_attachments TO sarim;
+ALTER TABLE public.post_attachments OWNER TO postgres;
+GRANT ALL ON TABLE public.post_attachments TO postgres;
 
 
 -- public.role_change_request definition
@@ -170,8 +190,8 @@ CREATE TABLE public.role_change_request (
 
 -- Permissions
 
-ALTER TABLE public.role_change_request OWNER TO sarim;
-GRANT ALL ON TABLE public.role_change_request TO sarim;
+ALTER TABLE public.role_change_request OWNER TO postgres;
+GRANT ALL ON TABLE public.role_change_request TO postgres;
 
 
 -- public."comments" definition
@@ -191,10 +211,21 @@ CREATE TABLE public."comments" (
 	CONSTRAINT comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
 
+-- Table Triggers
+
+create trigger trg_after_delete_comment after
+delete
+    on
+    public.comments for each row execute function trg_dec_issue_comment_count();
+create trigger trg_after_insert_comment after
+insert
+    on
+    public.comments for each row execute function trg_inc_issue_comment_count();
+
 -- Permissions
 
-ALTER TABLE public."comments" OWNER TO sarim;
-GRANT ALL ON TABLE public."comments" TO sarim;
+ALTER TABLE public."comments" OWNER TO postgres;
+GRANT ALL ON TABLE public."comments" TO postgres;
 
 
 -- public.group_comments definition
@@ -214,10 +245,21 @@ CREATE TABLE public.group_comments (
 	CONSTRAINT group_comments_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
 
+-- Table Triggers
+
+create trigger trg_after_delete_group_comment after
+delete
+    on
+    public.group_comments for each row execute function trg_dec_group_comment_count();
+create trigger trg_after_insert_group_comment after
+insert
+    on
+    public.group_comments for each row execute function trg_inc_group_comment_count();
+
 -- Permissions
 
-ALTER TABLE public.group_comments OWNER TO sarim;
-GRANT ALL ON TABLE public.group_comments TO sarim;
+ALTER TABLE public.group_comments OWNER TO postgres;
+GRANT ALL ON TABLE public.group_comments TO postgres;
 
 
 -- public.group_join_request definition
@@ -242,8 +284,8 @@ CREATE TABLE public.group_join_request (
 
 -- Permissions
 
-ALTER TABLE public.group_join_request OWNER TO sarim;
-GRANT ALL ON TABLE public.group_join_request TO sarim;
+ALTER TABLE public.group_join_request OWNER TO postgres;
+GRANT ALL ON TABLE public.group_join_request TO postgres;
 
 
 -- public.group_upvotes definition
@@ -257,16 +299,28 @@ CREATE TABLE public.group_upvotes (
 	group_id uuid NOT NULL,
 	user_id uuid NOT NULL,
 	made_at timestamptz DEFAULT now() NOT NULL,
+	upvote_weight int4 DEFAULT 1 NULL,
 	CONSTRAINT group_upvotes_group_id_user_id_key UNIQUE (group_id, user_id),
 	CONSTRAINT group_upvotes_pkey PRIMARY KEY (group_upvote_id),
 	CONSTRAINT group_upvotes_group_id_fkey FOREIGN KEY (group_id) REFERENCES public."groups"(group_id) ON DELETE CASCADE,
 	CONSTRAINT group_upvotes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
 
+-- Table Triggers
+
+create trigger trg_after_delete_group_upvote after
+delete
+    on
+    public.group_upvotes for each row execute function trg_group_upvote_after_delete();
+create trigger trg_after_insert_group_upvote before
+insert
+    on
+    public.group_upvotes for each row execute function trg_group_upvote_after_insert();
+
 -- Permissions
 
-ALTER TABLE public.group_upvotes OWNER TO sarim;
-GRANT ALL ON TABLE public.group_upvotes TO sarim;
+ALTER TABLE public.group_upvotes OWNER TO postgres;
+GRANT ALL ON TABLE public.group_upvotes TO postgres;
 
 
 -- public.issue_upvotes definition
@@ -280,16 +334,28 @@ CREATE TABLE public.issue_upvotes (
 	issue_id uuid NOT NULL,
 	user_id uuid NOT NULL,
 	made_at timestamptz DEFAULT now() NOT NULL,
+	upvote_weight int4 DEFAULT 1 NULL,
 	CONSTRAINT issue_upvotes_issue_id_user_id_key UNIQUE (issue_id, user_id),
 	CONSTRAINT issue_upvotes_pkey PRIMARY KEY (upvote_id),
 	CONSTRAINT issue_upvotes_issue_id_fkey FOREIGN KEY (issue_id) REFERENCES public.issues(issue_id) ON DELETE CASCADE,
 	CONSTRAINT issue_upvotes_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(user_id) ON DELETE CASCADE
 );
 
+-- Table Triggers
+
+create trigger trg_after_delete_issue_upvote after
+delete
+    on
+    public.issue_upvotes for each row execute function trg_issue_upvote_after_delete();
+create trigger trg_after_insert_issue_upvote before
+insert
+    on
+    public.issue_upvotes for each row execute function trg_issue_upvote_after_insert();
+
 -- Permissions
 
-ALTER TABLE public.issue_upvotes OWNER TO sarim;
-GRANT ALL ON TABLE public.issue_upvotes TO sarim;
+ALTER TABLE public.issue_upvotes OWNER TO postgres;
+GRANT ALL ON TABLE public.issue_upvotes TO postgres;
 
 
 
@@ -313,8 +379,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.add_comment(uuid, uuid, text) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.add_comment(uuid, uuid, text) TO sarim;
+ALTER FUNCTION public.add_comment(uuid, uuid, text) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.add_comment(uuid, uuid, text) TO postgres;
 
 -- DROP FUNCTION public.add_post_attachment(uuid, uuid, text);
 
@@ -336,8 +402,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.add_post_attachment(uuid, uuid, text) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.add_post_attachment(uuid, uuid, text) TO sarim;
+ALTER FUNCTION public.add_post_attachment(uuid, uuid, text) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.add_post_attachment(uuid, uuid, text) TO postgres;
 
 -- DROP FUNCTION public.cancel_group_join_request(uuid, uuid);
 
@@ -391,8 +457,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.cancel_group_join_request(uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.cancel_group_join_request(uuid, uuid) TO sarim;
+ALTER FUNCTION public.cancel_group_join_request(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.cancel_group_join_request(uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.create_group(uuid, text, text);
 
@@ -414,8 +480,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.create_group(uuid, text, text) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.create_group(uuid, text, text) TO sarim;
+ALTER FUNCTION public.create_group(uuid, text, text) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.create_group(uuid, text, text) TO postgres;
 
 -- DROP FUNCTION public.create_issue(uuid, text, text, uuid);
 
@@ -437,8 +503,70 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.create_issue(uuid, text, text, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.create_issue(uuid, text, text, uuid) TO sarim;
+ALTER FUNCTION public.create_issue(uuid, text, text, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.create_issue(uuid, text, text, uuid) TO postgres;
+
+-- DROP FUNCTION public.create_issue_with_attachments(uuid, text, text, uuid, text, jsonb);
+
+CREATE OR REPLACE FUNCTION public.create_issue_with_attachments(p_user_id uuid, p_title text, p_description text, p_group_id uuid DEFAULT NULL::uuid, p_display_picture_url text DEFAULT NULL::text, p_attachments jsonb DEFAULT '[]'::jsonb)
+ RETURNS TABLE(issue_id uuid, title text, description text, user_id uuid, group_id uuid, display_picture_url text, upvote_count integer, comment_count integer, posted_at timestamp with time zone, attachments jsonb)
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  v_issue_id uuid;
+  att jsonb;
+  v_attachments jsonb := '[]'::jsonb;
+  v_attachment record;
+BEGIN
+  -- Create the issue
+  INSERT INTO issues(user_id, title, description, group_id, display_picture_url, upvote_count, comment_count)
+  VALUES (p_user_id, p_title, p_description, p_group_id, p_display_picture_url, 0, 0)
+  RETURNING issues.issue_id INTO v_issue_id;
+
+  -- Insert attachments if any
+  FOR att IN SELECT * FROM jsonb_array_elements(p_attachments)
+  LOOP
+    INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
+    VALUES (
+      v_issue_id, 
+      (att->>'uploaded_by')::uuid, 
+      att->>'file_path'
+    )
+    RETURNING 
+      post_attachments.attachment_id,
+      post_attachments.file_path,
+      post_attachments.created_at
+    INTO v_attachment;
+    
+    -- Build attachments array
+    v_attachments := v_attachments || jsonb_build_object(
+      'attachment_id', v_attachment.attachment_id,
+      'file_path', v_attachment.file_path,
+      'created_at', v_attachment.created_at
+    );
+  END LOOP;
+
+  -- Return the created issue with attachments
+  RETURN QUERY 
+  SELECT 
+    v_issue_id,
+    p_title,
+    p_description,
+    p_user_id,
+    p_group_id,
+    p_display_picture_url,
+    0::int,
+    0::int,
+    NOW(),
+    v_attachments;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.create_issue_with_attachments(uuid, text, text, uuid, text, jsonb) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.create_issue_with_attachments(uuid, text, text, uuid, text, jsonb) TO postgres;
 
 -- DROP FUNCTION public.create_role(text, text, int4);
 
@@ -460,8 +588,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.create_role(text, text, int4) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.create_role(text, text, int4) TO sarim;
+ALTER FUNCTION public.create_role(text, text, int4) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.create_role(text, text, int4) TO postgres;
 
 -- DROP FUNCTION public.create_user(uuid, text, text, uuid, text);
 
@@ -483,8 +611,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.create_user(uuid, text, text, uuid, text) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.create_user(uuid, text, text, uuid, text) TO sarim;
+ALTER FUNCTION public.create_user(uuid, text, text, uuid, text) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.create_user(uuid, text, text, uuid, text) TO postgres;
 
 -- DROP FUNCTION public.delete_attachment(uuid);
 
@@ -504,8 +632,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.delete_attachment(uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.delete_attachment(uuid) TO sarim;
+ALTER FUNCTION public.delete_attachment(uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.delete_attachment(uuid) TO postgres;
 
 -- DROP FUNCTION public.get_attachment(uuid);
 
@@ -524,8 +652,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.get_attachment(uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.get_attachment(uuid) TO sarim;
+ALTER FUNCTION public.get_attachment(uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.get_attachment(uuid) TO postgres;
 
 -- DROP FUNCTION public.is_username_taken(text);
 
@@ -547,8 +675,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.is_username_taken(text) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.is_username_taken(text) TO sarim;
+ALTER FUNCTION public.is_username_taken(text) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.is_username_taken(text) TO postgres;
 
 -- DROP FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid);
 
@@ -570,8 +698,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) TO sarim;
+ALTER FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.process_group_join_request(uuid, varchar);
 
@@ -607,8 +735,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.process_group_join_request(uuid, varchar) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.process_group_join_request(uuid, varchar) TO sarim;
+ALTER FUNCTION public.process_group_join_request(uuid, varchar) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.process_group_join_request(uuid, varchar) TO postgres;
 
 -- DROP FUNCTION public.process_role_change_request(uuid, text);
 
@@ -641,8 +769,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.process_role_change_request(uuid, text) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.process_role_change_request(uuid, text) TO sarim;
+ALTER FUNCTION public.process_role_change_request(uuid, text) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.process_role_change_request(uuid, text) TO postgres;
 
 -- DROP FUNCTION public.remove_group_upvote(uuid, uuid);
 
@@ -651,6 +779,7 @@ CREATE OR REPLACE FUNCTION public.remove_group_upvote(p_group_id uuid, p_user_id
  LANGUAGE plpgsql
 AS $function$
 BEGIN
+    -- Just delete the upvote; trigger will handle count decrement
     DELETE FROM group_upvotes
     WHERE group_id = p_group_id
       AND user_id = p_user_id;
@@ -660,8 +789,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.remove_group_upvote(uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.remove_group_upvote(uuid, uuid) TO sarim;
+ALTER FUNCTION public.remove_group_upvote(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.remove_group_upvote(uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.remove_post_upvote(uuid, uuid);
 
@@ -670,23 +799,19 @@ CREATE OR REPLACE FUNCTION public.remove_post_upvote(p_issue_id uuid, p_user_id 
  LANGUAGE plpgsql
 AS $function$
 BEGIN
-    -- Delete the upvote record
+    -- Just delete the upvote; trigger will handle count decrement
     DELETE FROM issue_upvotes
     WHERE issue_id = p_issue_id
       AND user_id = p_user_id;
-
-    -- Decrement the upvote count on the post
-    UPDATE issues
-    SET upvote_count = GREATEST(upvote_count - 1, 0)
-    WHERE issue_id = p_issue_id;
+    -- Note: upvote_count update removed - trigger handles it now
 END;
 $function$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.remove_post_upvote(uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.remove_post_upvote(uuid, uuid) TO sarim;
+ALTER FUNCTION public.remove_post_upvote(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.remove_post_upvote(uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.submit_group_join_request(uuid, uuid, uuid);
 
@@ -708,8 +833,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.submit_group_join_request(uuid, uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.submit_group_join_request(uuid, uuid, uuid) TO sarim;
+ALTER FUNCTION public.submit_group_join_request(uuid, uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.submit_group_join_request(uuid, uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.submit_role_change_request(uuid, uuid, uuid);
 
@@ -731,8 +856,371 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.submit_role_change_request(uuid, uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.submit_role_change_request(uuid, uuid, uuid) TO sarim;
+ALTER FUNCTION public.submit_role_change_request(uuid, uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.submit_role_change_request(uuid, uuid, uuid) TO postgres;
+
+-- DROP FUNCTION public.toggle_group_upvote(uuid, uuid);
+
+CREATE OR REPLACE FUNCTION public.toggle_group_upvote(p_group_id uuid, p_user_id uuid)
+ RETURNS TABLE(upvoted boolean, upvote_count integer)
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  existing_upvote_id uuid;
+  final_count int;
+BEGIN
+  -- Check if upvote already exists
+  SELECT group_upvote_id INTO existing_upvote_id 
+  FROM group_upvotes 
+  WHERE group_id = p_group_id AND user_id = p_user_id;
+
+  IF existing_upvote_id IS NOT NULL THEN
+    -- Remove upvote (trigger will decrement count)
+    DELETE FROM group_upvotes WHERE group_upvote_id = existing_upvote_id;
+    
+    -- Get updated count
+    SELECT g.upvote_count INTO final_count FROM groups g WHERE g.group_id = p_group_id;
+    
+    -- Return false (not upvoted) and new count
+    RETURN QUERY SELECT false, COALESCE(final_count, 0);
+  ELSE
+    -- Add upvote (trigger will set weight and increment count)
+    INSERT INTO group_upvotes (group_id, user_id) 
+    VALUES (p_group_id, p_user_id);
+    
+    -- Get updated count
+    SELECT g.upvote_count INTO final_count FROM groups g WHERE g.group_id = p_group_id;
+    
+    -- Return true (upvoted) and new count
+    RETURN QUERY SELECT true, COALESCE(final_count, 0);
+  END IF;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.toggle_group_upvote(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.toggle_group_upvote(uuid, uuid) TO postgres;
+
+-- DROP FUNCTION public.toggle_issue_upvote(uuid, uuid);
+
+CREATE OR REPLACE FUNCTION public.toggle_issue_upvote(p_issue_id uuid, p_user_id uuid)
+ RETURNS TABLE(upvoted boolean, upvote_count integer)
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  existing_upvote_id uuid;
+  final_count int;
+BEGIN
+  -- Check if upvote already exists
+  SELECT upvote_id INTO existing_upvote_id 
+  FROM issue_upvotes 
+  WHERE issue_id = p_issue_id AND user_id = p_user_id;
+
+  IF existing_upvote_id IS NOT NULL THEN
+    -- Remove upvote (trigger will decrement count)
+    DELETE FROM issue_upvotes WHERE upvote_id = existing_upvote_id;
+    
+    -- Get updated count
+    SELECT i.upvote_count INTO final_count FROM issues i WHERE i.issue_id = p_issue_id;
+    
+    -- Return false (not upvoted) and new count
+    RETURN QUERY SELECT false, COALESCE(final_count, 0);
+  ELSE
+    -- Add upvote (trigger will set weight and increment count)
+    INSERT INTO issue_upvotes (issue_id, user_id) 
+    VALUES (p_issue_id, p_user_id);
+    
+    -- Get updated count
+    SELECT i.upvote_count INTO final_count FROM issues i WHERE i.issue_id = p_issue_id;
+    
+    -- Return true (upvoted) and new count
+    RETURN QUERY SELECT true, COALESCE(final_count, 0);
+  END IF;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.toggle_issue_upvote(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.toggle_issue_upvote(uuid, uuid) TO postgres;
+
+-- DROP FUNCTION public.trg_dec_group_comment_count();
+
+CREATE OR REPLACE FUNCTION public.trg_dec_group_comment_count()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  UPDATE groups SET comment_count = GREATEST(COALESCE(comment_count, 0) - 1, 0)
+  WHERE group_id = OLD.group_id;
+  RETURN OLD;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_dec_group_comment_count() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_dec_group_comment_count() TO postgres;
+
+-- DROP FUNCTION public.trg_dec_issue_comment_count();
+
+CREATE OR REPLACE FUNCTION public.trg_dec_issue_comment_count()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  UPDATE issues SET comment_count = GREATEST(COALESCE(comment_count, 0) - 1, 0)
+  WHERE issue_id = OLD.issue_id;
+  RETURN OLD;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_dec_issue_comment_count() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_dec_issue_comment_count() TO postgres;
+
+-- DROP FUNCTION public.trg_delete_issue_group_count();
+
+CREATE OR REPLACE FUNCTION public.trg_delete_issue_group_count()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  IF OLD.group_id IS NOT NULL THEN
+    UPDATE groups 
+    SET issue_count = GREATEST(issue_count - 1, 0) 
+    WHERE group_id = OLD.group_id;
+  END IF;
+  RETURN OLD;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_delete_issue_group_count() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_delete_issue_group_count() TO postgres;
+
+-- DROP FUNCTION public.trg_group_upvote_after_delete();
+
+CREATE OR REPLACE FUNCTION public.trg_group_upvote_after_delete()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  w int := COALESCE(OLD.upvote_weight, 1);
+BEGIN
+  -- Decrement the group's upvote count
+  UPDATE groups 
+  SET upvote_count = GREATEST(COALESCE(upvote_count, 0) - w, 0)
+  WHERE group_id = OLD.group_id;
+  
+  RETURN OLD;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_group_upvote_after_delete() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_group_upvote_after_delete() TO postgres;
+
+-- DROP FUNCTION public.trg_group_upvote_after_insert();
+
+CREATE OR REPLACE FUNCTION public.trg_group_upvote_after_insert()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  w int;
+BEGIN
+  -- Get the user's current role weight
+  SELECT r.upvote_weight INTO w
+  FROM users u 
+  JOIN roles r ON u.role_id = r.role_id
+  WHERE u.user_id = NEW.user_id;
+  
+  -- Default to 1 if role not found
+  IF w IS NULL THEN 
+    w := 1; 
+  END IF;
+  
+  -- Store the weight on the upvote record
+  NEW.upvote_weight := w;
+
+  -- Increment the group's upvote count
+  UPDATE groups 
+  SET upvote_count = COALESCE(upvote_count, 0) + w
+  WHERE group_id = NEW.group_id;
+
+  RETURN NEW;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_group_upvote_after_insert() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_group_upvote_after_insert() TO postgres;
+
+-- DROP FUNCTION public.trg_inc_group_comment_count();
+
+CREATE OR REPLACE FUNCTION public.trg_inc_group_comment_count()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  UPDATE groups SET comment_count = COALESCE(comment_count, 0) + 1
+  WHERE group_id = NEW.group_id;
+  RETURN NEW;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_inc_group_comment_count() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_inc_group_comment_count() TO postgres;
+
+-- DROP FUNCTION public.trg_inc_group_issue_count_on_insert();
+
+CREATE OR REPLACE FUNCTION public.trg_inc_group_issue_count_on_insert()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  IF NEW.group_id IS NOT NULL THEN
+    UPDATE groups 
+    SET issue_count = issue_count + 1 
+    WHERE group_id = NEW.group_id;
+  END IF;
+  RETURN NEW;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_inc_group_issue_count_on_insert() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_inc_group_issue_count_on_insert() TO postgres;
+
+-- DROP FUNCTION public.trg_inc_issue_comment_count();
+
+CREATE OR REPLACE FUNCTION public.trg_inc_issue_comment_count()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  UPDATE issues SET comment_count = COALESCE(comment_count, 0) + 1
+  WHERE issue_id = NEW.issue_id;
+  RETURN NEW;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_inc_issue_comment_count() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_inc_issue_comment_count() TO postgres;
+
+-- DROP FUNCTION public.trg_issue_upvote_after_delete();
+
+CREATE OR REPLACE FUNCTION public.trg_issue_upvote_after_delete()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  w int := COALESCE(OLD.upvote_weight, 1);
+BEGIN
+  -- Decrement the issue's upvote count
+  UPDATE issues 
+  SET upvote_count = GREATEST(COALESCE(upvote_count, 0) - w, 0)
+  WHERE issue_id = OLD.issue_id;
+  
+  RETURN OLD;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_issue_upvote_after_delete() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_issue_upvote_after_delete() TO postgres;
+
+-- DROP FUNCTION public.trg_issue_upvote_after_insert();
+
+CREATE OR REPLACE FUNCTION public.trg_issue_upvote_after_insert()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  w int;
+BEGIN
+  -- Get the user's current role weight
+  SELECT r.upvote_weight INTO w
+  FROM users u 
+  JOIN roles r ON u.role_id = r.role_id
+  WHERE u.user_id = NEW.user_id;
+  
+  -- Default to 1 if role not found
+  IF w IS NULL THEN 
+    w := 1; 
+  END IF;
+  
+  -- Store the weight on the upvote record
+  NEW.upvote_weight := w;
+
+  -- Increment the issue's upvote count
+  UPDATE issues 
+  SET upvote_count = COALESCE(upvote_count, 0) + w
+  WHERE issue_id = NEW.issue_id;
+
+  RETURN NEW;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_issue_upvote_after_insert() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_issue_upvote_after_insert() TO postgres;
+
+-- DROP FUNCTION public.trg_update_issue_group_count();
+
+CREATE OR REPLACE FUNCTION public.trg_update_issue_group_count()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  -- Decrement old group if it exists
+  IF OLD.group_id IS NOT NULL THEN
+    UPDATE groups 
+    SET issue_count = GREATEST(issue_count - 1, 0) 
+    WHERE group_id = OLD.group_id;
+  END IF;
+  
+  -- Increment new group if it exists
+  IF NEW.group_id IS NOT NULL THEN
+    UPDATE groups 
+    SET issue_count = issue_count + 1 
+    WHERE group_id = NEW.group_id;
+  END IF;
+  
+  RETURN NEW;
+END;
+$function$
+;
+
+-- Permissions
+
+ALTER FUNCTION public.trg_update_issue_group_count() OWNER TO postgres;
+GRANT ALL ON FUNCTION public.trg_update_issue_group_count() TO postgres;
 
 -- DROP FUNCTION public.upvote_group(uuid, uuid);
 
@@ -741,6 +1229,7 @@ CREATE OR REPLACE FUNCTION public.upvote_group(p_group_id uuid, p_user_id uuid)
  LANGUAGE plpgsql
 AS $function$
 BEGIN
+    -- Just insert the upvote; trigger will handle count increment
     INSERT INTO group_upvotes(group_id, user_id)
     VALUES (p_group_id, p_user_id)
     ON CONFLICT (group_id, user_id) DO NOTHING;
@@ -750,8 +1239,8 @@ $function$
 
 -- Permissions
 
-ALTER FUNCTION public.upvote_group(uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.upvote_group(uuid, uuid) TO sarim;
+ALTER FUNCTION public.upvote_group(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.upvote_group(uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.upvote_issue(uuid, uuid);
 
@@ -760,24 +1249,19 @@ CREATE OR REPLACE FUNCTION public.upvote_issue(p_issue_id uuid, p_user_id uuid)
  LANGUAGE plpgsql
 AS $function$
 BEGIN
+    -- Just insert the upvote; trigger will handle count increment
     INSERT INTO issue_upvotes(issue_id, user_id)
     VALUES (p_issue_id, p_user_id)
     ON CONFLICT (issue_id, user_id) DO NOTHING;
-
-    UPDATE issues
-    SET upvote_count = upvote_count + 1
-    WHERE issue_id = p_issue_id;
+    -- Note: upvote_count update removed - trigger handles it now
 END;
 $function$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.upvote_issue(uuid, uuid) OWNER TO sarim;
-GRANT ALL ON FUNCTION public.upvote_issue(uuid, uuid) TO sarim;
+ALTER FUNCTION public.upvote_issue(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON FUNCTION public.upvote_issue(uuid, uuid) TO postgres;
 
 
--- Permissions
-
-GRANT ALL ON SCHEMA public TO pg_database_owner;
-GRANT USAGE ON SCHEMA public TO public;
+-- Permissions;
