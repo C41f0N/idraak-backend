@@ -612,28 +612,11 @@ AS $function$
 DECLARE
     new_comment_id UUID;
 BEGIN
-    -- Start transaction
-    BEGIN
-        -- Validate issue exists
-        IF NOT EXISTS (SELECT 1 FROM issues WHERE issue_id = p_issue_id) THEN
-            RAISE EXCEPTION 'Issue % not found', p_issue_id;
-        END IF;
+    INSERT INTO comments(issue_id, user_id, content)
+    VALUES (p_issue_id, p_user_id, p_content)
+    RETURNING comment_id INTO new_comment_id;
 
-        -- Insert comment (trigger will handle comment_count increment)
-        INSERT INTO comments(issue_id, user_id, content)
-        VALUES (p_issue_id, p_user_id, p_content)
-        RETURNING comment_id INTO new_comment_id;
-
-        -- Commit transaction
-        COMMIT;
-
-        RETURN new_comment_id;
-    EXCEPTION
-        WHEN OTHERS THEN
-            -- Rollback on any error
-            ROLLBACK;
-            RAISE;
-    END;
+    RETURN new_comment_id;
 END;
 $function$
 ;
@@ -666,68 +649,60 @@ $function$
 ALTER FUNCTION public.add_post_attachment(uuid, uuid, text) OWNER TO postgres;
 GRANT ALL ON FUNCTION public.add_post_attachment(uuid, uuid, text) TO postgres;
 
--- DROP FUNCTION public.cancel_group_join_request(uuid, uuid);
+-- DROP PROCEDURE public.cancel_group_join_request(uuid, uuid);
 
-CREATE OR REPLACE FUNCTION public.cancel_group_join_request(p_req_id uuid, p_performer_user_id uuid)
- RETURNS void
+CREATE OR REPLACE PROCEDURE public.cancel_group_join_request(p_req_id uuid, p_performer_user_id uuid)
  LANGUAGE plpgsql
-AS $function$
+AS $procedure$
 DECLARE
-    v_issue_author_id UUID;
-    v_group_owner_id UUID;
+    v_issue_id UUID;
+    v_group_id UUID;
     v_requested_by_group BOOLEAN;
+    v_issue_author UUID;
+    v_group_owner UUID;
 BEGIN
-    -- Start transaction
-    BEGIN
-        IF p_performer_user_id IS NULL THEN
-            RAISE EXCEPTION 'performer user id is required';
+    -- Use view for request details
+    SELECT issue_id, group_id, requested_by_group
+    INTO v_issue_id, v_group_id, v_requested_by_group
+    FROM group_join_request
+    WHERE req_id = p_req_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'group_join_request % not found', p_req_id;
+    END IF;
+
+    SELECT user_id INTO v_issue_author FROM issues WHERE issue_id = v_issue_id;
+    SELECT owner_id INTO v_group_owner FROM groups WHERE group_id = v_group_id;
+
+    IF p_performer_user_id IS NULL THEN
+        RAISE EXCEPTION 'performer user id is required';
+    END IF;
+
+    -- Authorization: allow the issue author or group owner to cancel (either side)
+    IF v_requested_by_group THEN
+        -- Request made by group owner; allow group owner or issue author to cancel
+        IF p_performer_user_id <> v_issue_author AND p_performer_user_id <> v_group_owner THEN
+            RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
         END IF;
-
-        -- Get request details from view
-        SELECT issue_author_id, group_owner_id, requested_by_group
-        INTO v_issue_author_id, v_group_owner_id, v_requested_by_group
-        FROM v_pending_group_join_requests
-        WHERE req_id = p_req_id;
-
-        IF v_issue_author_id IS NULL THEN
-            RAISE EXCEPTION 'group_join_request % not found or already processed', p_req_id;
+    ELSE
+        -- Request made by issue author; allow issue author or group owner to cancel
+        IF p_performer_user_id <> v_group_owner AND p_performer_user_id <> v_issue_author THEN
+            RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
         END IF;
+    END IF;
 
-        -- Authorization: allow the issue author or group owner to cancel (either side)
-        IF v_requested_by_group THEN
-            -- Request made by group owner; allow group owner or issue author to cancel
-            IF p_performer_user_id <> v_group_owner_id AND p_performer_user_id <> v_issue_author_id THEN
-                RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
-            END IF;
-        ELSE
-            -- Request made by issue author; allow issue author or group owner to cancel
-            IF p_performer_user_id <> v_issue_author_id AND p_performer_user_id <> v_group_owner_id THEN
-                RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
-            END IF;
-        END IF;
-
-        -- Update request status
-        UPDATE group_join_request
-        SET status = 'cancelled',
-            handled_at = NOW()
-        WHERE req_id = p_req_id;
-
-        -- Commit transaction
-        COMMIT;
-    EXCEPTION
-        WHEN OTHERS THEN
-            -- Rollback on any error
-            ROLLBACK;
-            RAISE;
-    END;
+    UPDATE group_join_request
+    SET status = 'cancelled',
+        handled_at = NOW()
+    WHERE req_id = p_req_id;
 END;
-$function$
+$procedure$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.cancel_group_join_request(uuid, uuid) OWNER TO postgres;
-GRANT ALL ON FUNCTION public.cancel_group_join_request(uuid, uuid) TO postgres;
+ALTER PROCEDURE public.cancel_group_join_request(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON PROCEDURE public.cancel_group_join_request(uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.create_group(uuid, text, text);
 
@@ -738,28 +713,11 @@ AS $function$
 DECLARE
     new_group_id UUID;
 BEGIN
-    -- Start transaction
-    BEGIN
-        -- Validate owner exists using view
-        IF NOT EXISTS (SELECT 1 FROM v_users_with_roles WHERE user_id = p_owner_id) THEN
-            RAISE EXCEPTION 'User % not found', p_owner_id;
-        END IF;
+    INSERT INTO groups(owner_id, name, description)
+    VALUES (p_owner_id, p_name, p_description)
+    RETURNING group_id INTO new_group_id;
 
-        -- Insert group
-        INSERT INTO groups(owner_id, name, description)
-        VALUES (p_owner_id, p_name, p_description)
-        RETURNING group_id INTO new_group_id;
-
-        -- Commit transaction
-        COMMIT;
-
-        RETURN new_group_id;
-    EXCEPTION
-        WHEN OTHERS THEN
-            -- Rollback on any error
-            ROLLBACK;
-            RAISE;
-    END;
+    RETURN new_group_id;
 END;
 $function$
 ;
@@ -778,33 +736,11 @@ AS $function$
 DECLARE
     new_issue_id UUID;
 BEGIN
-    -- Start transaction
-    BEGIN
-        -- Validate user exists using view
-        IF NOT EXISTS (SELECT 1 FROM v_users_with_roles WHERE user_id = p_user_id) THEN
-            RAISE EXCEPTION 'User % not found', p_user_id;
-        END IF;
+    INSERT INTO issues(user_id, title, description, group_id)
+    VALUES (p_user_id, p_title, p_description, p_group_id)
+    RETURNING issue_id INTO new_issue_id;
 
-        -- Validate group exists if specified
-        IF p_group_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM groups WHERE group_id = p_group_id) THEN
-            RAISE EXCEPTION 'Group % not found', p_group_id;
-        END IF;
-
-        -- Insert issue (trigger will handle group issue_count increment)
-        INSERT INTO issues(user_id, title, description, group_id)
-        VALUES (p_user_id, p_title, p_description, p_group_id)
-        RETURNING issue_id INTO new_issue_id;
-
-        -- Commit transaction
-        COMMIT;
-
-        RETURN new_issue_id;
-    EXCEPTION
-        WHEN OTHERS THEN
-            -- Rollback on any error
-            ROLLBACK;
-            RAISE;
-    END;
+    RETURN new_issue_id;
 END;
 $function$
 ;
@@ -826,58 +762,47 @@ DECLARE
   v_attachments jsonb := '[]'::jsonb;
   v_attachment record;
 BEGIN
-  -- Start transaction
-  BEGIN
-    -- Create the issue
-    INSERT INTO issues(user_id, title, description, group_id, display_picture_url, upvote_count, comment_count)
-    VALUES (p_user_id, p_title, p_description, p_group_id, p_display_picture_url, 0, 0)
-    RETURNING issues.issue_id INTO v_issue_id;
+  -- Create the issue
+  INSERT INTO issues(user_id, title, description, group_id, display_picture_url, upvote_count, comment_count)
+  VALUES (p_user_id, p_title, p_description, p_group_id, p_display_picture_url, 0, 0)
+  RETURNING issues.issue_id INTO v_issue_id;
 
-    -- Insert attachments if any
-    FOR att IN SELECT * FROM jsonb_array_elements(p_attachments)
-    LOOP
-      INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
-      VALUES (
-        v_issue_id, 
-        (att->>'uploaded_by')::uuid, 
-        att->>'file_path'
-      )
-      RETURNING 
-        post_attachments.attachment_id,
-        post_attachments.file_path,
-        post_attachments.created_at
-      INTO v_attachment;
-      
-      -- Build attachments array
-      v_attachments := v_attachments || jsonb_build_object(
-        'attachment_id', v_attachment.attachment_id,
-        'file_path', v_attachment.file_path,
-        'created_at', v_attachment.created_at
-      );
-    END LOOP;
+  -- Insert attachments if any
+  FOR att IN SELECT * FROM jsonb_array_elements(p_attachments)
+  LOOP
+    INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
+    VALUES (
+      v_issue_id, 
+      (att->>'uploaded_by')::uuid, 
+      att->>'file_path'
+    )
+    RETURNING 
+      post_attachments.attachment_id,
+      post_attachments.file_path,
+      post_attachments.created_at
+    INTO v_attachment;
+    
+    -- Build attachments array
+    v_attachments := v_attachments || jsonb_build_object(
+      'attachment_id', v_attachment.attachment_id,
+      'file_path', v_attachment.file_path,
+      'created_at', v_attachment.created_at
+    );
+  END LOOP;
 
-    -- Commit transaction
-    COMMIT;
-
-    -- Return the created issue with attachments
-    RETURN QUERY 
-    SELECT 
-      v_issue_id,
-      p_title,
-      p_description,
-      p_user_id,
-      p_group_id,
-      p_display_picture_url,
-      0::int,
-      0::int,
-      NOW(),
-      v_attachments;
-  EXCEPTION
-    WHEN OTHERS THEN
-      -- Rollback on any error
-      ROLLBACK;
-      RAISE;
-  END;
+  -- Return the created issue with attachments
+  RETURN QUERY 
+  SELECT 
+    v_issue_id,
+    p_title,
+    p_description,
+    p_user_id,
+    p_group_id,
+    p_display_picture_url,
+    0::int,
+    0::int,
+    NOW(),
+    v_attachments;
 END;
 $function$
 ;
@@ -942,30 +867,9 @@ AS $function$
 DECLARE
   deleted_path TEXT;
 BEGIN
-  -- Start transaction
-  BEGIN
-    -- Get file path before deletion
-    SELECT file_path INTO deleted_path 
-    FROM post_attachments 
-    WHERE attachment_id = p_attachment_id;
-
-    IF deleted_path IS NULL THEN
-      RAISE EXCEPTION 'Attachment % not found', p_attachment_id;
-    END IF;
-
-    -- Delete attachment
-    DELETE FROM post_attachments WHERE attachment_id = p_attachment_id;
-
-    -- Commit transaction
-    COMMIT;
-
-    RETURN deleted_path;  -- Edge function will use this to delete from storage
-  EXCEPTION
-    WHEN OTHERS THEN
-      -- Rollback on any error
-      ROLLBACK;
-      RAISE;
-  END;
+  SELECT file_path INTO deleted_path FROM post_attachments WHERE attachment_id = p_attachment_id;
+  DELETE FROM post_attachments WHERE attachment_id = p_attachment_id;
+  RETURN deleted_path;  -- Edge function will use this to delete from storage
 END;
 $function$
 ;
@@ -1041,136 +945,108 @@ $function$
 ALTER FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) OWNER TO postgres;
 GRANT ALL ON FUNCTION public.owner_requests_issue_to_add(uuid, uuid, uuid) TO postgres;
 
--- DROP FUNCTION public.process_group_join_request(uuid, varchar);
+-- DROP PROCEDURE public.process_group_join_request(uuid, varchar);
 
-CREATE OR REPLACE FUNCTION public.process_group_join_request(p_req_id uuid, p_status character varying)
- RETURNS void
+CREATE OR REPLACE PROCEDURE public.process_group_join_request(p_req_id uuid, p_status character varying)
  LANGUAGE plpgsql
-AS $function$
+AS $procedure$
 DECLARE
     v_issue_id UUID;
     v_group_id UUID;
 BEGIN
-    -- Start transaction
-    BEGIN
-        -- Get issue_id and group_id from view
-        SELECT issue_id, group_id
-        INTO v_issue_id, v_group_id
-        FROM v_pending_group_join_requests
-        WHERE req_id = p_req_id;
+    -- Get issue_id and group_id for the request
+    SELECT issue_id, group_id
+    INTO v_issue_id, v_group_id
+    FROM group_join_request
+    WHERE req_id = p_req_id;
 
-        IF v_issue_id IS NULL THEN
-            RAISE EXCEPTION 'Group join request % not found or already processed', p_req_id;
-        END IF;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Request % not found', p_req_id;
+    END IF;
 
-        -- Update request status and handled timestamp
-        UPDATE group_join_request
-        SET status = p_status,
-            handled_at = NOW()
-        WHERE req_id = p_req_id;
+    -- Update request status and processed timestamp
+    UPDATE group_join_request
+    SET status = p_status,
+        handled_at = NOW()
+    WHERE req_id = p_req_id;
 
-        -- If approved, update issue to add it to the group
-        IF p_status = 'approved' THEN
-            UPDATE issues
-            SET group_id = v_group_id
-            WHERE issue_id = v_issue_id;
-        END IF;
-
-        -- Commit transaction
-        COMMIT;
-    EXCEPTION
-        WHEN OTHERS THEN
-            -- Rollback on any error
-            ROLLBACK;
-            RAISE;
-    END;
+    -- If approved, update the issue's group_id
+    IF p_status = 'approved' THEN
+        UPDATE issues
+        SET group_id = v_group_id
+        WHERE issue_id = v_issue_id;
+    END IF;
 END;
-$function$
+$procedure$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.process_group_join_request(uuid, varchar) OWNER TO postgres;
-GRANT ALL ON FUNCTION public.process_group_join_request(uuid, varchar) TO postgres;
+ALTER PROCEDURE public.process_group_join_request(uuid, varchar) OWNER TO postgres;
+GRANT ALL ON PROCEDURE public.process_group_join_request(uuid, varchar) TO postgres;
 
--- DROP FUNCTION public.process_role_change_request(uuid, text);
+-- DROP PROCEDURE public.process_role_change_request(uuid, text);
 
-CREATE OR REPLACE FUNCTION public.process_role_change_request(p_req_id uuid, p_status text)
- RETURNS void
+CREATE OR REPLACE PROCEDURE public.process_role_change_request(p_req_id uuid, p_status text)
  LANGUAGE plpgsql
-AS $function$
+AS $procedure$
 DECLARE
     v_user_id UUID;
     v_role_id UUID;
 BEGIN
-    -- Start transaction
-    BEGIN
-        -- Get request details from view
-        SELECT user_id, requested_role_id
-        INTO v_user_id, v_role_id
-        FROM v_pending_role_requests
-        WHERE req_id = p_req_id;
+    -- Use view to get request details
+    SELECT user_id, requested_role_id
+    INTO v_user_id, v_role_id
+    FROM v_pending_role_requests
+    WHERE req_id = p_req_id;
 
-        IF v_user_id IS NULL THEN
-            RAISE EXCEPTION 'Role change request % not found or already processed', p_req_id;
-        END IF;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Role change request % not found', p_req_id;
+    END IF;
 
-        -- Update request status
-        UPDATE role_change_request
-        SET status = p_status,
-            reviewed_at = NOW()
-        WHERE req_id = p_req_id;
+    UPDATE role_change_request
+    SET status = p_status,
+        reviewed_at = NOW()
+    WHERE req_id = p_req_id;
 
-        -- If approved, update user role
-        IF p_status = 'approved' THEN
-            UPDATE users
-            SET role_id = v_role_id
-            WHERE user_id = v_user_id;
-        END IF;
-
-        -- Commit transaction
-        COMMIT;
-    EXCEPTION
-        WHEN OTHERS THEN
-            -- Rollback on any error
-            ROLLBACK;
-            RAISE;
-    END;
+    IF p_status = 'approved' THEN
+        UPDATE users
+        SET role_id = v_role_id
+        WHERE user_id = v_user_id;
+    END IF;
 END;
-$function$
+$procedure$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.process_role_change_request(uuid, text) OWNER TO postgres;
-GRANT ALL ON FUNCTION public.process_role_change_request(uuid, text) TO postgres;
+ALTER PROCEDURE public.process_role_change_request(uuid, text) OWNER TO postgres;
+GRANT ALL ON PROCEDURE public.process_role_change_request(uuid, text) TO postgres;
 
--- DROP FUNCTION public.remove_group_upvote(uuid, uuid);
+-- DROP PROCEDURE public.remove_group_upvote(uuid, uuid);
 
-CREATE OR REPLACE FUNCTION public.remove_group_upvote(p_group_id uuid, p_user_id uuid)
- RETURNS void
+CREATE OR REPLACE PROCEDURE public.remove_group_upvote(p_group_id uuid, p_user_id uuid)
  LANGUAGE plpgsql
-AS $function$
+AS $procedure$
 BEGIN
     -- Just delete the upvote; trigger will handle count decrement
     DELETE FROM group_upvotes
     WHERE group_id = p_group_id
       AND user_id = p_user_id;
 END;
-$function$
+$procedure$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.remove_group_upvote(uuid, uuid) OWNER TO postgres;
-GRANT ALL ON FUNCTION public.remove_group_upvote(uuid, uuid) TO postgres;
+ALTER PROCEDURE public.remove_group_upvote(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON PROCEDURE public.remove_group_upvote(uuid, uuid) TO postgres;
 
--- DROP FUNCTION public.remove_post_upvote(uuid, uuid);
+-- DROP PROCEDURE public.remove_post_upvote(uuid, uuid);
 
-CREATE OR REPLACE FUNCTION public.remove_post_upvote(p_issue_id uuid, p_user_id uuid)
- RETURNS void
+CREATE OR REPLACE PROCEDURE public.remove_post_upvote(p_issue_id uuid, p_user_id uuid)
  LANGUAGE plpgsql
-AS $function$
+AS $procedure$
 BEGIN
     -- Just delete the upvote; trigger will handle count decrement
     DELETE FROM issue_upvotes
@@ -1178,13 +1054,13 @@ BEGIN
       AND user_id = p_user_id;
     -- Note: upvote_count update removed - trigger handles it now
 END;
-$function$
+$procedure$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.remove_post_upvote(uuid, uuid) OWNER TO postgres;
-GRANT ALL ON FUNCTION public.remove_post_upvote(uuid, uuid) TO postgres;
+ALTER PROCEDURE public.remove_post_upvote(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON PROCEDURE public.remove_post_upvote(uuid, uuid) TO postgres;
 
 -- DROP FUNCTION public.submit_group_join_request(uuid, uuid, uuid);
 
@@ -1595,32 +1471,30 @@ $function$
 ALTER FUNCTION public.trg_update_issue_group_count() OWNER TO postgres;
 GRANT ALL ON FUNCTION public.trg_update_issue_group_count() TO postgres;
 
--- DROP FUNCTION public.upvote_group(uuid, uuid);
+-- DROP PROCEDURE public.upvote_group(uuid, uuid);
 
-CREATE OR REPLACE FUNCTION public.upvote_group(p_group_id uuid, p_user_id uuid)
- RETURNS void
+CREATE OR REPLACE PROCEDURE public.upvote_group(p_group_id uuid, p_user_id uuid)
  LANGUAGE plpgsql
-AS $function$
+AS $procedure$
 BEGIN
     -- Just insert the upvote; trigger will handle count increment
     INSERT INTO group_upvotes(group_id, user_id)
     VALUES (p_group_id, p_user_id)
     ON CONFLICT (group_id, user_id) DO NOTHING;
 END;
-$function$
+$procedure$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.upvote_group(uuid, uuid) OWNER TO postgres;
-GRANT ALL ON FUNCTION public.upvote_group(uuid, uuid) TO postgres;
+ALTER PROCEDURE public.upvote_group(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON PROCEDURE public.upvote_group(uuid, uuid) TO postgres;
 
--- DROP FUNCTION public.upvote_issue(uuid, uuid);
+-- DROP PROCEDURE public.upvote_issue(uuid, uuid);
 
-CREATE OR REPLACE FUNCTION public.upvote_issue(p_issue_id uuid, p_user_id uuid)
- RETURNS void
+CREATE OR REPLACE PROCEDURE public.upvote_issue(p_issue_id uuid, p_user_id uuid)
  LANGUAGE plpgsql
-AS $function$
+AS $procedure$
 BEGIN
     -- Just insert the upvote; trigger will handle count increment
     INSERT INTO issue_upvotes(issue_id, user_id)
@@ -1628,13 +1502,13 @@ BEGIN
     ON CONFLICT (issue_id, user_id) DO NOTHING;
     -- Note: upvote_count update removed - trigger handles it now
 END;
-$function$
+$procedure$
 ;
 
 -- Permissions
 
-ALTER FUNCTION public.upvote_issue(uuid, uuid) OWNER TO postgres;
-GRANT ALL ON FUNCTION public.upvote_issue(uuid, uuid) TO postgres;
+ALTER PROCEDURE public.upvote_issue(uuid, uuid) OWNER TO postgres;
+GRANT ALL ON PROCEDURE public.upvote_issue(uuid, uuid) TO postgres;
 
 
 -- ============================================================================
