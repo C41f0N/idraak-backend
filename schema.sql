@@ -1,6 +1,10 @@
 -- DROP SCHEMA public;
 
 CREATE SCHEMA public AUTHORIZATION pg_database_owner;
+
+-- Begin transaction for schema creation
+BEGIN;
+
 -- public."admin" definition
 
 -- Drop table
@@ -358,6 +362,246 @@ ALTER TABLE public.issue_upvotes OWNER TO postgres;
 GRANT ALL ON TABLE public.issue_upvotes TO postgres;
 
 
+-- ============================================================================
+-- VIEWS
+-- ============================================================================
+
+-- View: Issues with user and group information
+CREATE OR REPLACE VIEW v_issues_detailed AS
+SELECT 
+    i.issue_id,
+    i.title,
+    i.description,
+    i.posted_at,
+    i.upvote_count,
+    i.comment_count,
+    i.display_picture_url,
+    i.user_id,
+    u.username,
+    u.full_name,
+    u.profile_picture_url AS user_profile_picture,
+    i.group_id,
+    g.name AS group_name,
+    g.owner_id AS group_owner_id,
+    (SELECT COUNT(*) FROM post_attachments pa WHERE pa.issue_id = i.issue_id) AS attachment_count
+FROM issues i
+JOIN users u ON i.user_id = u.user_id
+LEFT JOIN groups g ON i.group_id = g.group_id;
+
+-- View: Groups with owner and statistics
+CREATE OR REPLACE VIEW v_groups_detailed AS
+SELECT 
+    g.group_id,
+    g.name,
+    g.description,
+    g.created_at,
+    g.upvote_count,
+    g.comment_count,
+    g.display_picture_url,
+    g.issue_count,
+    g.owner_id,
+    u.username AS owner_username,
+    u.full_name AS owner_full_name,
+    u.profile_picture_url AS owner_profile_picture
+FROM groups g
+JOIN users u ON g.owner_id = u.user_id;
+
+-- View: Users with role information
+CREATE OR REPLACE VIEW v_users_with_roles AS
+SELECT 
+    u.user_id,
+    u.email,
+    u.username,
+    u.full_name,
+    u.profile_picture_url,
+    u.created_at,
+    u.role_id,
+    r.title AS role_title,
+    r.description AS role_description,
+    r.upvote_weight,
+    (SELECT COUNT(*) FROM issues WHERE user_id = u.user_id) AS issues_created,
+    (SELECT COUNT(*) FROM groups WHERE owner_id = u.user_id) AS groups_owned,
+    (SELECT COUNT(*) FROM comments WHERE user_id = u.user_id) AS comments_made
+FROM users u
+JOIN roles r ON u.role_id = r.role_id;
+
+-- View: Comments with user information
+CREATE OR REPLACE VIEW v_comments_detailed AS
+SELECT 
+    c.comment_id,
+    c.issue_id,
+    c.content,
+    c.posted_at,
+    c.user_id,
+    u.username,
+    u.full_name,
+    u.profile_picture_url,
+    i.title AS issue_title
+FROM comments c
+JOIN users u ON c.user_id = u.user_id
+JOIN issues i ON c.issue_id = i.issue_id;
+
+-- View: Group comments with user information
+CREATE OR REPLACE VIEW v_group_comments_detailed AS
+SELECT 
+    gc.comment_id,
+    gc.group_id,
+    gc.content,
+    gc.posted_at,
+    gc.user_id,
+    u.username,
+    u.full_name,
+    u.profile_picture_url,
+    g.name AS group_name
+FROM group_comments gc
+JOIN users u ON gc.user_id = u.user_id
+JOIN groups g ON gc.group_id = g.group_id;
+
+-- View: Pending role change requests
+CREATE OR REPLACE VIEW v_pending_role_requests AS
+SELECT 
+    rcr.req_id,
+    rcr.user_id,
+    u.username,
+    u.full_name,
+    u.email,
+    rcr.requested_role_id,
+    r.title AS requested_role_title,
+    current_r.title AS current_role_title,
+    rcr.status,
+    rcr.submitted_at,
+    rcr.reviewed_at,
+    rcr.reviewed_by_admin
+FROM role_change_request rcr
+JOIN users u ON rcr.user_id = u.user_id
+JOIN roles r ON rcr.requested_role_id = r.role_id
+JOIN roles current_r ON u.role_id = current_r.role_id
+WHERE rcr.status = 'pending'
+ORDER BY rcr.submitted_at DESC;
+
+-- View: Pending group join requests
+CREATE OR REPLACE VIEW v_pending_group_join_requests AS
+SELECT 
+    gjr.req_id,
+    gjr.issue_id,
+    i.title AS issue_title,
+    i.user_id AS issue_author_id,
+    issue_author.username AS issue_author_username,
+    gjr.group_id,
+    g.name AS group_name,
+    g.owner_id AS group_owner_id,
+    group_owner.username AS group_owner_username,
+    gjr.requested_by_group,
+    gjr.status,
+    gjr.requested_at,
+    gjr.handled_at
+FROM group_join_request gjr
+JOIN issues i ON gjr.issue_id = i.issue_id
+JOIN users issue_author ON i.user_id = issue_author.user_id
+JOIN groups g ON gjr.group_id = g.group_id
+JOIN users group_owner ON g.owner_id = group_owner.user_id
+WHERE gjr.status = 'pending'
+ORDER BY gjr.requested_at DESC;
+
+-- View: Popular issues (by upvote count)
+CREATE OR REPLACE VIEW v_popular_issues AS
+SELECT 
+    i.issue_id,
+    i.title,
+    i.description,
+    i.upvote_count,
+    i.comment_count,
+    i.posted_at,
+    i.display_picture_url,
+    u.username,
+    u.full_name,
+    g.name AS group_name
+FROM issues i
+JOIN users u ON i.user_id = u.user_id
+LEFT JOIN groups g ON i.group_id = g.group_id
+WHERE i.upvote_count > 0
+ORDER BY i.upvote_count DESC, i.posted_at DESC;
+
+-- View: Recent activity feed (issues and groups combined)
+CREATE OR REPLACE VIEW v_recent_activity AS
+SELECT 
+    issue_id AS id,
+    title,
+    description,
+    posted_at AS activity_date,
+    'issue' AS activity_type,
+    user_id,
+    username,
+    full_name,
+    upvote_count,
+    comment_count,
+    display_picture_url
+FROM v_issues_detailed
+WHERE group_id IS NULL
+UNION ALL
+SELECT 
+    group_id AS id,
+    name AS title,
+    description,
+    created_at AS activity_date,
+    'group' AS activity_type,
+    owner_id AS user_id,
+    owner_username AS username,
+    owner_full_name AS full_name,
+    upvote_count,
+    comment_count,
+    display_picture_url
+FROM v_groups_detailed
+ORDER BY activity_date DESC;
+
+-- View: User activity summary
+CREATE OR REPLACE VIEW v_user_activity_summary AS
+SELECT 
+    u.user_id,
+    u.username,
+    u.full_name,
+    COUNT(DISTINCT i.issue_id) AS total_issues,
+    COUNT(DISTINCT g.group_id) AS total_groups,
+    COUNT(DISTINCT c.comment_id) AS total_comments,
+    COUNT(DISTINCT iu.upvote_id) AS total_issue_upvotes,
+    COUNT(DISTINCT gu.group_upvote_id) AS total_group_upvotes,
+    COALESCE(SUM(i.upvote_count), 0) AS total_upvotes_received_on_issues,
+    COALESCE(SUM(g.upvote_count), 0) AS total_upvotes_received_on_groups
+FROM users u
+LEFT JOIN issues i ON u.user_id = i.user_id
+LEFT JOIN groups g ON u.user_id = g.owner_id
+LEFT JOIN comments c ON u.user_id = c.user_id
+LEFT JOIN issue_upvotes iu ON u.user_id = iu.user_id
+LEFT JOIN group_upvotes gu ON u.user_id = gu.user_id
+GROUP BY u.user_id, u.username, u.full_name;
+
+-- Permissions for views
+ALTER VIEW v_issues_detailed OWNER TO postgres;
+ALTER VIEW v_groups_detailed OWNER TO postgres;
+ALTER VIEW v_users_with_roles OWNER TO postgres;
+ALTER VIEW v_comments_detailed OWNER TO postgres;
+ALTER VIEW v_group_comments_detailed OWNER TO postgres;
+ALTER VIEW v_pending_role_requests OWNER TO postgres;
+ALTER VIEW v_pending_group_join_requests OWNER TO postgres;
+ALTER VIEW v_popular_issues OWNER TO postgres;
+ALTER VIEW v_recent_activity OWNER TO postgres;
+ALTER VIEW v_user_activity_summary OWNER TO postgres;
+
+GRANT ALL ON v_issues_detailed TO postgres;
+GRANT ALL ON v_groups_detailed TO postgres;
+GRANT ALL ON v_users_with_roles TO postgres;
+GRANT ALL ON v_comments_detailed TO postgres;
+GRANT ALL ON v_group_comments_detailed TO postgres;
+GRANT ALL ON v_pending_role_requests TO postgres;
+GRANT ALL ON v_pending_group_join_requests TO postgres;
+GRANT ALL ON v_popular_issues TO postgres;
+GRANT ALL ON v_recent_activity TO postgres;
+GRANT ALL ON v_user_activity_summary TO postgres;
+
+
+-- ============================================================================
+-- STORED PROCEDURES AND FUNCTIONS
+-- ============================================================================
 
 -- DROP FUNCTION public.add_comment(uuid, uuid, text);
 
@@ -368,11 +612,28 @@ AS $function$
 DECLARE
     new_comment_id UUID;
 BEGIN
-    INSERT INTO comments(issue_id, user_id, content)
-    VALUES (p_issue_id, p_user_id, p_content)
-    RETURNING comment_id INTO new_comment_id;
+    -- Start transaction
+    BEGIN
+        -- Validate issue exists
+        IF NOT EXISTS (SELECT 1 FROM issues WHERE issue_id = p_issue_id) THEN
+            RAISE EXCEPTION 'Issue % not found', p_issue_id;
+        END IF;
 
-    RETURN new_comment_id;
+        -- Insert comment (trigger will handle comment_count increment)
+        INSERT INTO comments(issue_id, user_id, content)
+        VALUES (p_issue_id, p_user_id, p_content)
+        RETURNING comment_id INTO new_comment_id;
+
+        -- Commit transaction
+        COMMIT;
+
+        RETURN new_comment_id;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Rollback on any error
+            ROLLBACK;
+            RAISE;
+    END;
 END;
 $function$
 ;
@@ -412,45 +673,53 @@ CREATE OR REPLACE FUNCTION public.cancel_group_join_request(p_req_id uuid, p_per
  LANGUAGE plpgsql
 AS $function$
 DECLARE
-    v_issue_id UUID;
-    v_group_id UUID;
-    v_requested_by_user BOOLEAN;
-    v_issue_author UUID;
-    v_group_owner UUID;
+    v_issue_author_id UUID;
+    v_group_owner_id UUID;
+    v_requested_by_group BOOLEAN;
 BEGIN
-    SELECT issue_id, group_id, requested_by_user
-    INTO v_issue_id, v_group_id, v_requested_by_user
-    FROM group_join_request
-    WHERE req_id = p_req_id;
-
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'group_join_request % not found', p_req_id;
-    END IF;
-
-    SELECT user_id INTO v_issue_author FROM issues WHERE issue_id = v_issue_id;
-    SELECT owner_id INTO v_group_owner FROM groups WHERE group_id = v_group_id;
-
-    IF p_performer_user_id IS NULL THEN
-        RAISE EXCEPTION 'performer user id is required';
-    END IF;
-
-    -- Authorization: allow the issue author or group owner to cancel (either side)
-    IF v_requested_by_user THEN
-        -- Request made by issue author; allow issue author or group owner to cancel
-        IF p_performer_user_id <> v_issue_author AND p_performer_user_id <> v_group_owner THEN
-            RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
+    -- Start transaction
+    BEGIN
+        IF p_performer_user_id IS NULL THEN
+            RAISE EXCEPTION 'performer user id is required';
         END IF;
-    ELSE
-        -- Request made by group owner; allow group owner or issue author to cancel
-        IF p_performer_user_id <> v_group_owner AND p_performer_user_id <> v_issue_author THEN
-            RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
-        END IF;
-    END IF;
 
-    UPDATE group_join_request
-    SET status = 'cancelled',
-        handled_at = NOW()
-    WHERE req_id = p_req_id;
+        -- Get request details from view
+        SELECT issue_author_id, group_owner_id, requested_by_group
+        INTO v_issue_author_id, v_group_owner_id, v_requested_by_group
+        FROM v_pending_group_join_requests
+        WHERE req_id = p_req_id;
+
+        IF v_issue_author_id IS NULL THEN
+            RAISE EXCEPTION 'group_join_request % not found or already processed', p_req_id;
+        END IF;
+
+        -- Authorization: allow the issue author or group owner to cancel (either side)
+        IF v_requested_by_group THEN
+            -- Request made by group owner; allow group owner or issue author to cancel
+            IF p_performer_user_id <> v_group_owner_id AND p_performer_user_id <> v_issue_author_id THEN
+                RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
+            END IF;
+        ELSE
+            -- Request made by issue author; allow issue author or group owner to cancel
+            IF p_performer_user_id <> v_issue_author_id AND p_performer_user_id <> v_group_owner_id THEN
+                RAISE EXCEPTION 'user % not authorized to cancel request %', p_performer_user_id, p_req_id;
+            END IF;
+        END IF;
+
+        -- Update request status
+        UPDATE group_join_request
+        SET status = 'cancelled',
+            handled_at = NOW()
+        WHERE req_id = p_req_id;
+
+        -- Commit transaction
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Rollback on any error
+            ROLLBACK;
+            RAISE;
+    END;
 END;
 $function$
 ;
@@ -469,11 +738,28 @@ AS $function$
 DECLARE
     new_group_id UUID;
 BEGIN
-    INSERT INTO groups(owner_id, name, description)
-    VALUES (p_owner_id, p_name, p_description)
-    RETURNING group_id INTO new_group_id;
+    -- Start transaction
+    BEGIN
+        -- Validate owner exists using view
+        IF NOT EXISTS (SELECT 1 FROM v_users_with_roles WHERE user_id = p_owner_id) THEN
+            RAISE EXCEPTION 'User % not found', p_owner_id;
+        END IF;
 
-    RETURN new_group_id;
+        -- Insert group
+        INSERT INTO groups(owner_id, name, description)
+        VALUES (p_owner_id, p_name, p_description)
+        RETURNING group_id INTO new_group_id;
+
+        -- Commit transaction
+        COMMIT;
+
+        RETURN new_group_id;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Rollback on any error
+            ROLLBACK;
+            RAISE;
+    END;
 END;
 $function$
 ;
@@ -492,11 +778,33 @@ AS $function$
 DECLARE
     new_issue_id UUID;
 BEGIN
-    INSERT INTO issues(user_id, title, description, group_id)
-    VALUES (p_user_id, p_title, p_description, p_group_id)
-    RETURNING issue_id INTO new_issue_id;
+    -- Start transaction
+    BEGIN
+        -- Validate user exists using view
+        IF NOT EXISTS (SELECT 1 FROM v_users_with_roles WHERE user_id = p_user_id) THEN
+            RAISE EXCEPTION 'User % not found', p_user_id;
+        END IF;
 
-    RETURN new_issue_id;
+        -- Validate group exists if specified
+        IF p_group_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM groups WHERE group_id = p_group_id) THEN
+            RAISE EXCEPTION 'Group % not found', p_group_id;
+        END IF;
+
+        -- Insert issue (trigger will handle group issue_count increment)
+        INSERT INTO issues(user_id, title, description, group_id)
+        VALUES (p_user_id, p_title, p_description, p_group_id)
+        RETURNING issue_id INTO new_issue_id;
+
+        -- Commit transaction
+        COMMIT;
+
+        RETURN new_issue_id;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Rollback on any error
+            ROLLBACK;
+            RAISE;
+    END;
 END;
 $function$
 ;
@@ -518,47 +826,58 @@ DECLARE
   v_attachments jsonb := '[]'::jsonb;
   v_attachment record;
 BEGIN
-  -- Create the issue
-  INSERT INTO issues(user_id, title, description, group_id, display_picture_url, upvote_count, comment_count)
-  VALUES (p_user_id, p_title, p_description, p_group_id, p_display_picture_url, 0, 0)
-  RETURNING issues.issue_id INTO v_issue_id;
+  -- Start transaction
+  BEGIN
+    -- Create the issue
+    INSERT INTO issues(user_id, title, description, group_id, display_picture_url, upvote_count, comment_count)
+    VALUES (p_user_id, p_title, p_description, p_group_id, p_display_picture_url, 0, 0)
+    RETURNING issues.issue_id INTO v_issue_id;
 
-  -- Insert attachments if any
-  FOR att IN SELECT * FROM jsonb_array_elements(p_attachments)
-  LOOP
-    INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
-    VALUES (
-      v_issue_id, 
-      (att->>'uploaded_by')::uuid, 
-      att->>'file_path'
-    )
-    RETURNING 
-      post_attachments.attachment_id,
-      post_attachments.file_path,
-      post_attachments.created_at
-    INTO v_attachment;
-    
-    -- Build attachments array
-    v_attachments := v_attachments || jsonb_build_object(
-      'attachment_id', v_attachment.attachment_id,
-      'file_path', v_attachment.file_path,
-      'created_at', v_attachment.created_at
-    );
-  END LOOP;
+    -- Insert attachments if any
+    FOR att IN SELECT * FROM jsonb_array_elements(p_attachments)
+    LOOP
+      INSERT INTO post_attachments (issue_id, uploaded_by, file_path)
+      VALUES (
+        v_issue_id, 
+        (att->>'uploaded_by')::uuid, 
+        att->>'file_path'
+      )
+      RETURNING 
+        post_attachments.attachment_id,
+        post_attachments.file_path,
+        post_attachments.created_at
+      INTO v_attachment;
+      
+      -- Build attachments array
+      v_attachments := v_attachments || jsonb_build_object(
+        'attachment_id', v_attachment.attachment_id,
+        'file_path', v_attachment.file_path,
+        'created_at', v_attachment.created_at
+      );
+    END LOOP;
 
-  -- Return the created issue with attachments
-  RETURN QUERY 
-  SELECT 
-    v_issue_id,
-    p_title,
-    p_description,
-    p_user_id,
-    p_group_id,
-    p_display_picture_url,
-    0::int,
-    0::int,
-    NOW(),
-    v_attachments;
+    -- Commit transaction
+    COMMIT;
+
+    -- Return the created issue with attachments
+    RETURN QUERY 
+    SELECT 
+      v_issue_id,
+      p_title,
+      p_description,
+      p_user_id,
+      p_group_id,
+      p_display_picture_url,
+      0::int,
+      0::int,
+      NOW(),
+      v_attachments;
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- Rollback on any error
+      ROLLBACK;
+      RAISE;
+  END;
 END;
 $function$
 ;
@@ -623,9 +942,30 @@ AS $function$
 DECLARE
   deleted_path TEXT;
 BEGIN
-  SELECT file_path INTO deleted_path FROM post_attachments WHERE attachment_id = p_attachment_id;
-  DELETE FROM post_attachments WHERE attachment_id = p_attachment_id;
-  RETURN deleted_path;  -- Edge function will use this to delete from storage
+  -- Start transaction
+  BEGIN
+    -- Get file path before deletion
+    SELECT file_path INTO deleted_path 
+    FROM post_attachments 
+    WHERE attachment_id = p_attachment_id;
+
+    IF deleted_path IS NULL THEN
+      RAISE EXCEPTION 'Attachment % not found', p_attachment_id;
+    END IF;
+
+    -- Delete attachment
+    DELETE FROM post_attachments WHERE attachment_id = p_attachment_id;
+
+    -- Commit transaction
+    COMMIT;
+
+    RETURN deleted_path;  -- Edge function will use this to delete from storage
+  EXCEPTION
+    WHEN OTHERS THEN
+      -- Rollback on any error
+      ROLLBACK;
+      RAISE;
+  END;
 END;
 $function$
 ;
@@ -711,24 +1051,39 @@ DECLARE
     v_issue_id UUID;
     v_group_id UUID;
 BEGIN
-    -- Get issue_id and group_id for the request
-    SELECT issue_id, group_id
-    INTO v_issue_id, v_group_id
-    FROM group_join_request
-    WHERE req_id = p_req_id;
+    -- Start transaction
+    BEGIN
+        -- Get issue_id and group_id from view
+        SELECT issue_id, group_id
+        INTO v_issue_id, v_group_id
+        FROM v_pending_group_join_requests
+        WHERE req_id = p_req_id;
 
-    -- Update request status and processed timestamp
-    UPDATE group_join_request
-    SET status = p_status,
-        processed_at = NOW()
-    WHERE req_id = p_req_id;
+        IF v_issue_id IS NULL THEN
+            RAISE EXCEPTION 'Group join request % not found or already processed', p_req_id;
+        END IF;
 
-    -- If approved, add the post to the group
-    IF p_status = 'approved' THEN
-        INSERT INTO group_posts(group_id, post_id)
-        VALUES (v_group_id, v_issue_id)
-        ON CONFLICT (group_id, post_id) DO NOTHING;
-    END IF;
+        -- Update request status and handled timestamp
+        UPDATE group_join_request
+        SET status = p_status,
+            handled_at = NOW()
+        WHERE req_id = p_req_id;
+
+        -- If approved, update issue to add it to the group
+        IF p_status = 'approved' THEN
+            UPDATE issues
+            SET group_id = v_group_id
+            WHERE issue_id = v_issue_id;
+        END IF;
+
+        -- Commit transaction
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Rollback on any error
+            ROLLBACK;
+            RAISE;
+    END;
 END;
 $function$
 ;
@@ -748,21 +1103,39 @@ DECLARE
     v_user_id UUID;
     v_role_id UUID;
 BEGIN
-    SELECT user_id, requested_role_id
-    INTO v_user_id, v_role_id
-    FROM role_change_request
-    WHERE req_id = p_req_id;
+    -- Start transaction
+    BEGIN
+        -- Get request details from view
+        SELECT user_id, requested_role_id
+        INTO v_user_id, v_role_id
+        FROM v_pending_role_requests
+        WHERE req_id = p_req_id;
 
-    UPDATE role_change_request
-    SET status = p_status,
-        reviewed_at = NOW()
-    WHERE req_id = p_req_id;
+        IF v_user_id IS NULL THEN
+            RAISE EXCEPTION 'Role change request % not found or already processed', p_req_id;
+        END IF;
 
-    IF p_status = 'approved' THEN
-        UPDATE users
-        SET role_id = v_role_id
-        WHERE user_id = v_user_id;
-    END IF;
+        -- Update request status
+        UPDATE role_change_request
+        SET status = p_status,
+            reviewed_at = NOW()
+        WHERE req_id = p_req_id;
+
+        -- If approved, update user role
+        IF p_status = 'approved' THEN
+            UPDATE users
+            SET role_id = v_role_id
+            WHERE user_id = v_user_id;
+        END IF;
+
+        -- Commit transaction
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Rollback on any error
+            ROLLBACK;
+            RAISE;
+    END;
 END;
 $function$
 ;
@@ -1263,5 +1636,12 @@ $function$
 ALTER FUNCTION public.upvote_issue(uuid, uuid) OWNER TO postgres;
 GRANT ALL ON FUNCTION public.upvote_issue(uuid, uuid) TO postgres;
 
+
+-- ============================================================================
+-- COMMIT TRANSACTION
+-- ============================================================================
+
+-- Commit all schema changes
+COMMIT;
 
 -- Permissions;
